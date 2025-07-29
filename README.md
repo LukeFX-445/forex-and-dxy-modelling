@@ -72,8 +72,7 @@ Optional probability density functions over a 1–3 day horizon illustrate the d
 A probability density function f(x) is normalised so that
 ∫-∞^∞ f(x) dx = 1
 
-The probability that the return falls within an interval [ 𝑎 , 𝑏 ] is computed by integrating over that range:
-P(a≤X≤b)=∫ab​f(x)dx.
 ---
 
 This repository thus implements two complementary models: one to rank forex pairs and another to forecast DXY direction. Both integrate volatility estimation, dimensional reduction and sentiment analysis to produce probabilistic trade signals.
+Together, these models provide a unified framework for FX analysis that blends technical structure, statistical volatility modelling, and event-driven sentiment. By combining regime-aware filtering, dimensional reduction, and probabilistic scoring, they enable informed directional bias forecasts and asymmetric trade selection.
