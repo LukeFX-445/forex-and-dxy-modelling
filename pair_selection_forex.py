@@ -14,7 +14,6 @@ Functions:
 
 At the end of the script the various signals are combined into a simple voting system which outputs a bullish, bearish or neutral bias along with a confidence score.
 """
-
 !pip install yfinance --quiet
 import yfinance as yf
 import pandas as pd
