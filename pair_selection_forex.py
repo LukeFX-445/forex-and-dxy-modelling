@@ -2,7 +2,7 @@
 DXY Directional Model
 ---------------------
 
-This script analyses the US Dollar Index (DXY) using a combination of market data, principal component analysis, volatility modelling, event‑driven signals and sentiment analysis to form a directional bias.
+This script analyses the US Dollar Index (DXY) and major foreign currencies using a combination of market data, principal component analysis, volatility modelling, event‑driven signals and sentiment analysis to form a directional bias.
 
 Functions:
 - fetch_dxy_data: downloads DXY OHLCV data and calculates ADR.
