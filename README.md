@@ -26,11 +26,11 @@ Principal Component Analysis (PCA) is applied to daily returns and ADR‑normali
 
 Forward return paths are simulated under a geometric Brownian motion (GBM) assumption. In a GBM framework the change in price is modelled as
 
-\[
-\Delta S = S \times \left(\mu\,\Delta t + \sigma\,\epsilon\,\Delta t\right),
-\]
 
-where \(S\) is the price, \(\mu\) is the drift, \(\sigma\) is the volatility and \(\epsilon\) is a random normal shock. Scenarios are generated under varying volatility shocks and macro events to produce a probabilistic score for each currency.
+ΔS = S × ( μ Δt + σ ε Δt )
+
+where S is the price, μ is the drift, σ is the volatility and ε is a random normal shock. Scenarios are generated under varying volatility shocks and macro 
+
 
 ### 1.6 Sentiment Analysis
 
@@ -59,10 +59,8 @@ News feeds are parsed to detect hawkish or dovish tones and risk‑on or risk‑
 ### 2.5 Probability and Scoring
 
 Each factor is converted into a confidence score on a 0 – 1 scale. The final directional bias is computed as the difference between the probability of a bullish outcome and the probability of a bearish outcome:
+Δ_score = P(bullish) - P(bearish)
 
-\[
-\Delta_{\mathrm{score}} = P(\text{bullish}) - P(\text{bearish}).
-\]
 
 Scores are adjusted dynamically so that macro events carry more weight when volatility is elevated. A summary output reports the directional bias (bullish, bearish or neutral), the confidence level (low, medium or high) and an expected price range based on ADR‑adjusted bands.
 
