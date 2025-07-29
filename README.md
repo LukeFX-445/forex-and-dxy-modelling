@@ -68,8 +68,13 @@ Scores are adjusted dynamically so that macro events carry more weight when vola
 
 Optional probability density functions over a 1–3 day horizon illustrate the distribution of expected returns and allow the assessment of skewness, fat tails and confidence intervals before trade execution.
 
-A probability density function f(x) is normalised so that the integral of f over the entire real line equals one: ∫_{-∞}^{∞} f(x)  dx  = 1. The probability that the return falls within an interval [a, b] is computed by integrating the density over that interval: P(a ≤ X ≤ b) = ∫_{a}^{b} f(x) dx.
 
+
+A probability density function f(x) is normalised so that
+∫-∞^∞ f(x) dx = 1
+
+The probability that the return falls within an interval [a, b] b] is computed by integrating the density over that interval:
+P(a ≤ X ≤ b) = ∫a^b f(x) dx
 ---
 
 This repository thus implements two complementary models: one to rank forex pairs and another to forecast DXY direction. Both integrate volatility estimation, dimensional reduction and sentiment analysis to produce probabilistic trade signals.
