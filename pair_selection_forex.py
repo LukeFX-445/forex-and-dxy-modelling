@@ -1,5 +1,5 @@
 """
-DXY Directional Model
+Pair Selection Model
 ---------------------
 
 This script analyses the US Dollar Index (DXY) and major foreign currencies using a combination of market data, principal component analysis, volatility modelling, event‑driven signals and sentiment analysis to form a directional bias.
