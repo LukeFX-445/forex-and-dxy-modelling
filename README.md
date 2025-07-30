@@ -68,10 +68,6 @@ Scores are adjusted dynamically so that macro events carry more weight when vola
 
 Optional probability density functions over a 1–3 day horizon illustrate the distribution of expected returns and allow the assessment of skewness, fat tails and confidence intervals before trade execution.
 
-
-A probability density function f(x) is normalised so that
-∫-∞^∞ f(x) dx = 1
-
 ---
 
 This repository thus implements two complementary models: one to rank forex pairs and another to forecast DXY direction. Both integrate volatility estimation, dimensional reduction and sentiment analysis to produce probabilistic trade signals.
