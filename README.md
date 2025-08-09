@@ -80,6 +80,6 @@ Optional PDFs for 1–3 day horizons describe return distributions (skewness, ku
 ---
 
 ## 4. Limitations
-- Public data may lag and schema can change; verify key diagnostics on event days.
+- Public data may lag, and schema can change; verify key diagnostics on event days.
 - Calendar and sentiment features are **lightweight heuristics**; consider extending with richer NLP or professional data feeds.
 - This codebase is provided strictly for **research**; it does **not** constitute investment advice.
