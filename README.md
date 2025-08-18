@@ -19,7 +19,6 @@ This model ranks currencies by structural context, volatility regime, and cross-
 - **Conditional volatility models**: **GARCH(1,1)**, **EGARCH**, and **GJR-GARCH** with **Student-t** innovations (`rescale=False`). Model selection uses **AIC**; if fitting fails, a **local realised σ** fallback maintains continuity.
 
 ### 1.3 Directional Filtering
-- Microstructure cues: single-sided **liquidity sweeps** (prior high/low taken), displacement moves, and simple **FVG/OB** heuristics.
 - Regime awareness: signal weights adapt to volatility state (e.g., ADR expansion and an elevated 10/50-day vol-ratio increase emphasis on trend-following evidence).
 
 ### 1.4 Dimensionality Reduction
