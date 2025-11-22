@@ -5,7 +5,7 @@ import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-!pip install yfinance arch pandas numpy scipy scikit-learn statsmodels fredapi beautifulsoup4 requests ta-lib-binary --quiet
+!pip install yfinance arch pandas numpy scipy scikit-learn statsmodels fredapi beautifulsoup4 requests --quiet
 
 import yfinance as yf
 import pandas as pd
@@ -24,6 +24,7 @@ from sklearn.linear_model import LassoCV
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 from bs4 import BeautifulSoup
 import math
+import os # Added for os.path.exists
 
 # ============================================================================
 # SECTION 1: S&P 500 CONSTITUENTS & DATA COLLECTION
@@ -39,19 +40,19 @@ def get_sp500_tickers():
         url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
         tables = pd.read_html(url)
         df = tables[0]
-        
+
         tickers = df['Symbol'].tolist()
         sectors = dict(zip(df['Symbol'], df['GICS Sector']))
         industries = dict(zip(df['Symbol'], df['GICS Sub-Industry']))
-        
+
         # Clean ticker symbols (handle special cases)
         tickers = [t.replace('.', '-') for t in tickers]
-        
+
         return tickers, sectors, industries
     except Exception as e:
         print(f"Warning: Failed to fetch S&P 500 list: {e}")
         # Fallback to major components
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 
+        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B',
                 'UNH', 'JNJ', 'JPM', 'V', 'PG', 'MA', 'HD', 'CVX', 'MRK', 'ABBV',
                 'PEP', 'KO', 'COST', 'AVGO', 'WMT', 'DIS', 'CSCO', 'ACN', 'LLY',
                 'TMO', 'VZ', 'ADBE', 'NFLX', 'NKE', 'CMCSA', 'DHR', 'PM', 'TXN',
@@ -100,18 +101,18 @@ for i, ticker in enumerate(top_stocks):
     try:
         if (i + 1) % 20 == 0:
             print(f"  Progress: {i+1}/{len(top_stocks)} stocks...")
-        
+
         stock = yf.Ticker(ticker)
-        
+
         # Historical prices
         hist = stock.history(start=start_date, end=end_date, auto_adjust=False)
-        
+
         if hist.empty or len(hist) < 100:
             continue
-        
+
         price_data[ticker] = hist['Close']
         volume_data[ticker] = hist['Volume']
-        
+
         # Fundamental data
         info = stock.info
         fundamental_data[ticker] = {
@@ -134,9 +135,9 @@ for i, ticker in enumerate(top_stocks):
             '52w_high': info.get('fiftyTwoWeekHigh', np.nan),
             '52w_low': info.get('fiftyTwoWeekLow', np.nan)
         }
-        
+
         time.sleep(0.1)  # Rate limiting
-        
+
     except Exception as e:
         print(f"  Warning: Failed to fetch {ticker}: {e}")
         continue
@@ -170,14 +171,41 @@ simple_returns = prices_df.pct_change().dropna()
 
 # Market benchmark (S&P 500 index)
 spy = yf.download('SPY', start=start_date, end=end_date, progress=False)
-spy_returns = np.log(spy['Close'] / spy['Close'].shift(1)).dropna()
-spy_returns = spy_returns.reindex(returns.index).ffill()
+
+# Robustify spy_returns calculation
+if spy.empty or 'Close' not in spy.columns:
+    print("Warning: Could not download SPY data or 'Close' column missing. Initializing spy_returns as empty DataFrame.")
+    spy_returns_series = pd.Series(dtype=float) # Create an empty Series
+else:
+    spy_returns_series = np.log(spy['Close'] / spy['Close'].shift(1)).dropna()
+    # Reindex and forward fill against the prices_df index, which should be aligned with other stock returns
+    if not spy_returns_series.empty:
+        # Reindex to match the main returns index, then forward fill
+        spy_returns_series = spy_returns_series.reindex(returns.index).ffill()
+        # If there are still NaNs at the beginning after reindexing/ffill, drop them
+        spy_returns_series = spy_returns_series.dropna()
+    else:
+        print("Warning: SPY returns data is empty after calculation. Initializing spy_returns as empty Series.")
+
+# Ensure spy_returns_series is a Series before creating DataFrame to avoid ValueError
+if isinstance(spy_returns_series, pd.DataFrame):
+    if not spy_returns_series.empty and 'SPY' in spy_returns_series.columns:
+        spy_returns_series = spy_returns_series['SPY'] # Extract the Series if it's a DataFrame with 'SPY' column
+    else:
+        spy_returns_series = pd.Series(dtype=float) # Otherwise, treat as empty Series
+
+# Convert to DataFrame with 'SPY' column for consistency
+if spy_returns_series.empty:
+    spy_returns = pd.DataFrame(columns=['SPY'])
+else:
+    spy_returns = pd.DataFrame({'SPY': spy_returns_series})
+
 
 # Calculate basic statistics
 stats_dict = {}
 for stock in stocks:
     ret = returns[stock].dropna()
-    
+
     stats_dict[stock] = {
         'mean_daily_return': float(ret.mean()),
         'std_daily': float(ret.std()),
@@ -214,11 +242,11 @@ sector_momentum = {}
 for sector, stock_list in sector_stocks.items():
     if len(stock_list) == 0:
         continue
-    
+
     # Equal-weighted sector return
     sector_ret = returns[stock_list].mean(axis=1)
     sector_returns[sector] = sector_ret
-    
+
     # Sector momentum (multiple timeframes)
     sector_momentum[sector] = {
         '5d': float(sector_ret.tail(5).sum() * 100),
@@ -256,18 +284,22 @@ print("\n[6/15] Detecting market regimes...")
 
 # Market-wide regime detection using S&P 500
 try:
-    spy_ret = spy_returns * 100
+    # Ensure spy_returns has data and is treated as a Series for MarkovRegression
+    if spy_returns['SPY'].dropna().empty:
+        raise ValueError("SPY returns data is empty or all NaN, cannot run Markov Regression.")
     
+    spy_ret_series = spy_returns['SPY'] * 100
+
     model = MarkovRegression(
-        spy_ret,
+        spy_ret_series,
         k_regimes=3,  # Bull, Bear, Neutral
         switching_variance=True
     )
-    
+
     res = model.fit(maxiter=100, disp=False, warn_convergence=False)
     smoothed_probs = res.smoothed_marginal_probabilities
     current_regime_probs = smoothed_probs.iloc[-1].values
-    
+
     market_regime = {
         'current_regime': int(np.argmax(current_regime_probs)),
         'bull_prob': float(current_regime_probs[0]),
@@ -275,31 +307,41 @@ try:
         'bear_prob': float(current_regime_probs[2]),
         'regime_vols': [float(np.sqrt(res.params[f'sigma2[{i}]']) / 100) for i in range(3)]
     }
-    
+
     regime_names = ['Bull', 'Neutral', 'Bear']
     current_regime_name = regime_names[market_regime['current_regime']]
-    
+
     print(f"✓ Market Regime: {current_regime_name}")
     print(f"  Bull: {market_regime['bull_prob']:.1%}, Neutral: {market_regime['neutral_prob']:.1%}, Bear: {market_regime['bear_prob']:.1%}")
-    
+
 except Exception as e:
     print(f"Note: Regime detection using simpler method: {e}")
-    # Fallback: use VIX or volatility clustering
-    vol_20d = spy_returns.rolling(20).std()
-    vol_60d = spy_returns.rolling(60).std()
+    # Fallback: use volatility clustering if SPY data is available
     
-    current_vol = vol_20d.iloc[-1]
-    avg_vol = vol_60d.iloc[-1]
-    
-    if current_vol > avg_vol * 1.5:
-        market_regime = {'current_regime': 2, 'bear_prob': 0.7}
-        current_regime_name = 'Bear'
-    elif current_vol < avg_vol * 0.7:
-        market_regime = {'current_regime': 0, 'bull_prob': 0.7}
-        current_regime_name = 'Bull'
-    else:
-        market_regime = {'current_regime': 1, 'neutral_prob': 0.7}
+    # Check if spy_returns DataFrame contains any valid data for 'SPY'
+    if spy_returns['SPY'].dropna().empty: # Check if the 'SPY' column has any non-NaN values
+        print("Warning: SPY returns data is empty or all NaN. Defaulting to Neutral market regime.")
+        market_regime = {'current_regime': 1, 'neutral_prob': 1.0}
         current_regime_name = 'Neutral'
+    else:
+        # Calculate rolling volatilities, ensuring scalar values are extracted
+        vol_20d_val = spy_returns['SPY'].rolling(20).std().iloc[-1]
+        vol_60d_val = spy_returns['SPY'].rolling(60).std().iloc[-1]
+
+        # Check if the extracted values are NaN (e.g., not enough data for rolling window)
+        if pd.isna(vol_20d_val) or pd.isna(vol_60d_val):
+             print("Warning: Not enough valid SPY data for volatility calculation (e.g., less than 60 days). Defaulting to Neutral market regime.")
+             market_regime = {'current_regime': 1, 'neutral_prob': 1.0}
+             current_regime_name = 'Neutral'
+        elif vol_20d_val > vol_60d_val * 1.5:
+            market_regime = {'current_regime': 2, 'bear_prob': 0.7}
+            current_regime_name = 'Bear'
+        elif vol_20d_val < vol_60d_val * 0.7:
+            market_regime = {'current_regime': 0, 'bull_prob': 0.7}
+            current_regime_name = 'Bull'
+        else:
+            market_regime = {'current_regime': 1, 'neutral_prob': 0.7}
+            current_regime_name = 'Neutral'
 
 # Save regime info
 with open('market_regime.json', 'w') as f:
@@ -319,10 +361,10 @@ vol_regime_adjusted = {}
 for stock in stocks[:50]:  # Top 50 for speed
     try:
         series = returns[stock] * 100
-        
+
         # Try multiple GARCH specifications
         models = []
-        
+
         # GARCH(1,1) with Student-t
         try:
             m1 = arch_model(series, vol='Garch', p=1, q=1, dist='t', rescale=False)
@@ -330,7 +372,7 @@ for stock in stocks[:50]:  # Top 50 for speed
             models.append(r1)
         except:
             pass
-        
+
         # EGARCH(1,1) with Student-t
         try:
             m2 = arch_model(series, vol='EGARCH', p=1, q=1, dist='t', rescale=False)
@@ -338,7 +380,7 @@ for stock in stocks[:50]:  # Top 50 for speed
             models.append(r2)
         except:
             pass
-        
+
         # GJR-GARCH(1,1,1)
         try:
             m3 = arch_model(series, vol='Garch', p=1, o=1, q=1, dist='t', rescale=False)
@@ -346,14 +388,14 @@ for stock in stocks[:50]:  # Top 50 for speed
             models.append(r3)
         except:
             pass
-        
+
         if models:
             best = min(models, key=lambda r: r.aic)
             fcast = best.forecast(horizon=1)
             vol_forecasts[stock] = float(np.sqrt(fcast.variance.values[-1, 0]) / 100)
         else:
             vol_forecasts[stock] = float(series.std() / 100)
-        
+
         # Regime adjustment
         beta = fundamentals_df.loc[stock, 'beta']
         if market_regime['current_regime'] == 2:  # Bear market
@@ -362,9 +404,9 @@ for stock in stocks[:50]:  # Top 50 for speed
             regime_mult = 0.9
         else:  # Neutral
             regime_mult = 1.0
-        
+
         vol_regime_adjusted[stock] = vol_forecasts[stock] * regime_mult * beta
-        
+
     except Exception as e:
         vol_forecasts[stock] = 0.02
         vol_regime_adjusted[stock] = 0.02
@@ -391,33 +433,33 @@ factor_exposures = {}
 
 for stock in stocks:
     fund = fundamentals_df.loc[stock]
-    
+
     # Value factor (lower P/E, P/B is better)
     value_score = 0
     if not pd.isna(fund['pe_ratio']) and fund['pe_ratio'] > 0:
         value_score += (1 / fund['pe_ratio']) * 100
     if not pd.isna(fund['price_to_book']) and fund['price_to_book'] > 0:
         value_score += (1 / fund['price_to_book']) * 100
-    
+
     # Growth factor (revenue growth, earnings growth)
     growth_score = (
         fund['revenue_growth'] * 0.4 +
         fund['earnings_growth'] * 0.6
     )
-    
+
     # Momentum factor (recent returns)
     momentum_score = float(returns[stock].tail(60).sum() * 100)
-    
+
     # Quality factor (ROE, profit margins, low debt)
     quality_score = (
         fund['roe'] * 0.4 +
         fund['profit_margin'] * 0.3 +
         (100 - fund['debt_to_equity'] if not pd.isna(fund['debt_to_equity']) else 50) * 0.3
     )
-    
+
     # Size factor (market cap, log scale)
     size_score = np.log10(fund['market_cap']) if fund['market_cap'] > 0 else 0
-    
+
     factor_exposures[stock] = {
         'value': value_score,
         'growth': growth_score,
@@ -450,7 +492,7 @@ technical_indicators = {}
 for stock in stocks:
     price = prices_df[stock].dropna()
     ret = returns[stock].dropna()
-    
+
     # RSI (14-day)
     try:
         delta = price.diff()
@@ -460,7 +502,7 @@ for stock in stocks:
         rsi = float(100 - (100 / (1 + rs.iloc[-1])))
     except:
         rsi = 50.0
-    
+
     # MACD
     try:
         ema_12 = price.ewm(span=12).mean()
@@ -470,7 +512,7 @@ for stock in stocks:
         macd_hist = float(macd.iloc[-1] - signal.iloc[-1])
     except:
         macd_hist = 0.0
-    
+
     # Bollinger Bands
     try:
         sma_20 = price.rolling(20).mean()
@@ -478,28 +520,28 @@ for stock in stocks:
         bb_position = float((price.iloc[-1] - (sma_20.iloc[-1] - 2*std_20.iloc[-1])) / (4*std_20.iloc[-1]))
     except:
         bb_position = 0.5
-    
+
     # Distance from 52-week high/low
     high_52w = fundamentals_df.loc[stock, '52w_high']
     low_52w = fundamentals_df.loc[stock, '52w_low']
     current_price = float(price.iloc[-1])
-    
+
     if not pd.isna(high_52w) and high_52w > 0:
         dist_from_high = ((high_52w - current_price) / high_52w) * 100
     else:
         dist_from_high = 0
-    
+
     if not pd.isna(low_52w) and low_52w > 0:
         dist_from_low = ((current_price - low_52w) / low_52w) * 100
     else:
         dist_from_low = 0
-    
+
     # Average True Range (ATR)
     try:
         high = yf.Ticker(stock).history(period='3mo')['High']
         low = yf.Ticker(stock).history(period='3mo')['Low']
         close = yf.Ticker(stock).history(period='3mo')['Close']
-        
+
         tr1 = high - low
         tr2 = abs(high - close.shift(1))
         tr3 = abs(low - close.shift(1))
@@ -508,7 +550,7 @@ for stock in stocks:
         atr_pct = (atr / current_price) * 100
     except:
         atr_pct = 2.0
-    
+
     technical_indicators[stock] = {
         'rsi': rsi,
         'macd_hist': macd_hist,
@@ -544,36 +586,38 @@ for stock in stocks:
             'revenue_growth': fundamentals_df.loc[stock, 'revenue_growth'],
             'earnings_growth': fundamentals_df.loc[stock, 'earnings_growth'],
             'beta': fundamentals_df.loc[stock, 'beta'],
-            
+
             # Factor scores
             'value': factors_df.loc[stock, 'value'],
             'growth': factors_df.loc[stock, 'growth'],
             'momentum': factors_df.loc[stock, 'momentum'],
             'quality': factors_df.loc[stock, 'quality'],
-            
+
             # Technical indicators
             'rsi': tech_df.loc[stock, 'rsi'],
             'macd_hist': tech_df.loc[stock, 'macd_hist'],
             'bb_position': tech_df.loc[stock, 'bb_position'],
             'dist_from_52w_high': tech_df.loc[stock, 'dist_from_52w_high'],
-            
+
             # Risk metrics
             'volatility': stats_df.loc[stock, 'ann_volatility'],
             'sharpe': stats_df.loc[stock, 'sharpe_ratio'],
             'max_drawdown': stats_df.loc[stock, 'max_drawdown'],
-            
+
             # Historical returns
             'ret_5d': float(returns[stock].tail(5).sum() * 100),
             'ret_20d': float(returns[stock].tail(20).sum() * 100),
             'ret_60d': float(returns[stock].tail(60).sum() * 100)
         }
-        
+
         ml_features[stock] = features
     except Exception as e:
         continue
 
 ml_df = pd.DataFrame(ml_features).T
-ml_df = ml_df.replace([np.inf, -np.inf], np.nan).fillna(ml_df.median())
+ml_df = ml_df.replace([np.inf, -np.inf], np.nan)
+# Fill NaN values with column median, and then fill any remaining NaN values (e.g., from all-NaN columns) with 0
+ml_df = ml_df.fillna(ml_df.median(numeric_only=True)).fillna(0)
 
 # Target: forward 20-day return
 targets = {}
@@ -632,25 +676,25 @@ expected_returns = {}
 for stock in stocks:
     if stock not in ml_df_clean.index:
         continue
-    
+
     # Combine multiple signals
-    
+
     # 1. ML prediction (20-day forward return)
     ml_signal = ml_pred_df.loc[stock, 'ensemble_pred']
-    
+
     # 2. Momentum signal
     momentum_signal = factors_df.loc[stock, 'momentum']
-    
+
     # 3. Sector momentum
     sector = fundamentals_df.loc[stock, 'sector']
     sector_signal = sector_scores.get(sector, 0)
-    
+
     # 4. Technical signal
     tech_signal = (
         (tech_df.loc[stock, 'rsi'] - 50) / 50 * 5 +  # RSI deviation
         tech_df.loc[stock, 'macd_hist'] * 10  # MACD histogram
     )
-    
+
     # 5. Factor composite
     factor_signal = (
         factors_scaled.loc[stock, 'value'] * 0.2 +
@@ -658,7 +702,7 @@ for stock in stocks:
         factors_scaled.loc[stock, 'momentum'] * 0.25 +
         factors_scaled.loc[stock, 'quality'] * 0.3
     )
-    
+
     # Weighted combination
     expected_return = (
         ml_signal * 0.35 +
@@ -667,13 +711,13 @@ for stock in stocks:
         tech_signal * 0.15 +
         factor_signal * 0.15
     )
-    
+
     # Adjust for market regime
     if market_regime['current_regime'] == 2:  # Bear market
         expected_return *= 0.7  # Reduce expectations
     elif market_regime['current_regime'] == 0:  # Bull market
         expected_return *= 1.1  # Increase expectations
-    
+
     expected_returns[stock] = {
         'expected_return_20d': expected_return,
         'ml_signal': ml_signal,
@@ -703,7 +747,7 @@ def simulate_stock_price(S0, mu, sigma, beta, days=20, trials=3000,
     - Beta-adjusted market exposure
     """
     np.random.seed(42)
-    
+
     # Regime adjustments
     if market_regime == 'Bear':
         vol_mult = 1.5
@@ -714,34 +758,34 @@ def simulate_stock_price(S0, mu, sigma, beta, days=20, trials=3000,
     else:
         vol_mult = 1.0
         drift_adjust = 0.0
-    
+
     sigma_adj = sigma * vol_mult * beta
     mu_adj = mu + drift_adjust
-    
+
     results = []
-    
+
     for _ in range(trials):
         price = S0
-        
+
         for t in range(days):
             # Student-t distributed returns (df=5 for fat tails)
             eps = stats.t.rvs(df=5, size=1)[0] / np.sqrt(5/3)
-            
+
             # Jump component (earnings surprises, news events)
             if np.random.rand() < jump_prob:
                 # Jumps can be positive or negative
                 jump = np.random.normal(0, 0.05)  # ±5% typical jump
             else:
                 jump = 0
-            
+
             # Geometric Brownian Motion with jumps
             drift_term = (mu_adj/days - 0.5 * sigma_adj**2)
             diffusion_term = sigma_adj * eps / np.sqrt(days)
-            
+
             price *= np.exp(drift_term + diffusion_term + jump)
-        
+
         results.append(price)
-    
+
     return np.array(results)
 
 # Run simulations for top stocks
@@ -751,17 +795,17 @@ horizons = {'1w': 5, '2w': 10, '1m': 20, '2m': 40, '3m': 60}
 for horizon_name, days in horizons.items():
     if horizon_name != '1m':  # Focus on 1-month for speed
         continue
-    
+
     print(f"  Simulating {horizon_name} horizon...")
     sim_results[horizon_name] = {}
-    
+
     for stock in list(expected_returns_df.index)[:50]:  # Top 50
         try:
             S0 = float(prices_df[stock].iloc[-1])
             mu = expected_returns_df.loc[stock, 'expected_return_20d'] / 100  # Convert to fraction
             sigma = vol_regime_adjusted.get(stock, 0.02)
             beta = fundamentals_df.loc[stock, 'beta']
-            
+
             # Run simulation
             final_prices = simulate_stock_price(
                 S0, mu, sigma, beta,
@@ -769,10 +813,10 @@ for horizon_name, days in horizons.items():
                 market_regime=current_regime_name,
                 jump_prob=0.03
             )
-            
+
             # Calculate statistics
             returns_sim = (final_prices / S0 - 1.0) * 100
-            
+
             sim_results[horizon_name][stock] = {
                 'current_price': S0,
                 'mean_return': float(np.mean(returns_sim)),
@@ -791,7 +835,7 @@ for horizon_name, days in horizons.items():
                 'max_upside': float(np.percentile(returns_sim, 95)),
                 'max_downside': float(np.percentile(returns_sim, 5))
             }
-            
+
         except Exception as e:
             continue
 
@@ -809,37 +853,37 @@ print("\n[13/15] Computing risk-adjusted rankings...")
 
 def calculate_risk_metrics(stock, sim_data, expected_ret):
     """Calculate comprehensive risk-adjusted performance metrics"""
-    
+
     if stock not in sim_data:
         return None
-    
+
     stats_sim = sim_data[stock]
-    
+
     # Sharpe Ratio (annualized)
     sharpe = (stats_sim['mean_return'] / stats_sim['std_return'] * np.sqrt(252/20)) if stats_sim['std_return'] > 0 else 0
-    
+
     # Sortino Ratio (downside deviation only)
     downside_returns = np.array([r for r in np.random.normal(stats_sim['mean_return'], stats_sim['std_return'], 1000) if r < 0])
     downside_std = np.std(downside_returns) if len(downside_returns) > 0 else 1
     sortino = stats_sim['mean_return'] / downside_std if downside_std > 0 else 0
-    
+
     # Information Ratio (vs SPY)
     tracking_error = vol_regime_adjusted.get(stock, 0.02) * 100
     spy_expected = 0.5  # Assume SPY ~0.5% monthly in current regime
     information_ratio = (stats_sim['mean_return'] - spy_expected) / tracking_error if tracking_error > 0 else 0
-    
+
     # Calmar Ratio (return / max drawdown)
     max_dd = abs(stats_df.loc[stock, 'max_drawdown']) if stock in stats_df.index else 10
     calmar = stats_sim['mean_return'] / max_dd if max_dd > 0 else 0
-    
+
     # Omega Ratio
     gains = max(stats_sim['mean_return'], 0)
     losses = abs(min(stats_sim['mean_return'], 0))
     omega = (gains / losses) if losses > 0 else float('inf') if gains > 0 else 0
-    
+
     # Return to VaR
     return_to_var = stats_sim['mean_return'] / stats_sim['VaR_95'] if stats_sim['VaR_95'] > 0 else 0
-    
+
     # Composite score (weighted combination)
     composite_score = (
         sharpe * 0.25 +
@@ -849,7 +893,7 @@ def calculate_risk_metrics(stock, sim_data, expected_ret):
         min(omega, 10) * 0.10 +  # Cap omega at 10
         return_to_var * 0.15
     )
-    
+
     return {
         'sharpe_ratio': sharpe,
         'sortino_ratio': sortino,
@@ -869,12 +913,12 @@ for stock in sim_results.get('1m', {}):
         sim_results['1m'],
         expected_returns_df.loc[stock, 'expected_return_20d']
     )
-    
+
     if metrics is None:
         continue
-    
+
     sim_data = sim_results['1m'][stock]
-    
+
     rankings[stock] = {
         'expected_return': sim_data['mean_return'],
         'volatility': stats_df.loc[stock, 'ann_volatility'] if stock in stats_df.index else np.nan,
@@ -914,22 +958,23 @@ print("\n[14/15] Constructing optimal portfolios...")
 
 def construct_portfolio(rankings_df, n_stocks=20, diversify_sectors=True):
     """Construct portfolio with diversification constraints"""
-    
+
     portfolio = []
     sector_counts = {}
     max_per_sector = 5 if diversify_sectors else n_stocks
-    
-    for stock, row in rankings_df.iterrows():
+
+    for stock_idx in rankings_df.index:
         if len(portfolio) >= n_stocks:
             break
-        
+        row = rankings_df.loc[stock_idx]
+
         sector = row['sector']
         sector_count = sector_counts.get(sector, 0)
-        
+
         if sector_count < max_per_sector:
-            portfolio.append(stock)
+            portfolio.append(stock_idx)
             sector_counts[sector] = sector_count + 1
-    
+
     return portfolio
 
 # Construct different portfolio strategies
@@ -976,9 +1021,9 @@ for portfolio_name, stocks in portfolios.items():
     portfolio_returns = expected_returns_df.loc[stocks, 'expected_return_20d'].mean()
     portfolio_vol = np.sqrt(np.mean([vol_regime_adjusted.get(s, 0.02)**2 for s in stocks])) * 100 * np.sqrt(252)
     portfolio_sharpe = portfolio_returns / (portfolio_vol / np.sqrt(252/20)) if portfolio_vol > 0 else 0
-    
+
     sectors_in_portfolio = fundamentals_df.loc[stocks, 'sector'].value_counts()
-    
+
     portfolio_metrics[portfolio_name] = {
         'expected_return_20d': portfolio_returns,
         'ann_volatility': portfolio_vol,
@@ -1011,14 +1056,15 @@ print("=" * 80)
 # Best overall picks
 top_10 = rankings_df.head(10)
 
-print("\n🏆 TOP 10 STOCKS (Risk-Adjusted):\n")
-for i, (stock, row) in enumerate(top_10.iterrows(), 1):
+print("\n🏆 TOP 10 STOCKS (Risk-AdJUSTED):\n")
+for i, stock in enumerate(top_10.index, 1):
+    row = top_10.loc[stock]
     print(f"{i}. {stock} ({row['sector']})")
     print(f"   Current Price: ${row['current_price']:.2f}")
     print(f"   Price Target (1M): ${row['price_target']:.2f} ({row['expected_return']:.2f}%)")
     print(f"   Probability Up: {row['prob_profitable']:.1%}")
     print(f"   Sharpe Ratio: {row['sharpe']:.2f}")
-    print(f"   Max Upside: {row['max_upside']:.2f}% | Max Downside: {row['max_downside']:.2f}%")
+    print(f"   Max Upside: {row['max_upside']:.2f}% | Max Downside: {row['max_downside']:.2f}%वरुन)")
     print()
 
 # Sector leaders
@@ -1036,13 +1082,14 @@ for sector in rankings_df['sector'].unique():
 
 # High-conviction picks (high probability + high return)
 high_conviction = rankings_df[
-    (rankings_df['prob_profitable'] > 0.65) & 
+    (rankings_df['prob_profitable'] > 0.65) &
     (rankings_df['expected_return'] > 3.0)
 ].sort_values('composite_score', ascending=False)
 
 if not high_conviction.empty:
     print("\n💎 HIGH-CONVICTION PICKS (>65% Win Rate, >3% Expected Return):\n")
-    for stock, row in high_conviction.head(5).iterrows():
+    for stock in high_conviction.head(5).index:
+        row = high_conviction.loc[stock]
         print(f"{stock}: {row['expected_return']:.2f}% ({row['prob_profitable']:.1%} win rate)")
 
 # Contrarian opportunities (oversold with good fundamentals)
@@ -1053,7 +1100,8 @@ contrarian = rankings_df[
 
 if not contrarian.empty:
     print("\n🔄 CONTRARIAN OPPORTUNITIES (Oversold with Upside):\n")
-    for stock, row in contrarian.head(5).iterrows():
+    for stock in contrarian.head(5).index:
+        row = contrarian.loc[stock]
         rsi = tech_df.loc[stock, 'rsi']
         print(f"{stock}: RSI={rsi:.1f}, Expected Return={row['expected_return']:.2f}%")
 
@@ -1062,7 +1110,8 @@ div_stocks = rankings_df[rankings_df['dividend_yield'] > 2.0].sort_values('divid
 
 if not div_stocks.empty:
     print("\n💰 TOP DIVIDEND PLAYS (>2% Yield):\n")
-    for stock, row in div_stocks.head(5).iterrows():
+    for stock in div_stocks.head(5).index:
+        row = div_stocks.loc[stock]
         print(f"{stock}: {row['dividend_yield']:.2f}% yield, {row['expected_return']:.2f}% expected return")
 
 # ============================================================================
@@ -1077,25 +1126,27 @@ print("=" * 80)
 print("\n⚠️  RISK WARNINGS:\n")
 
 high_risk_stocks = rankings_df[
-    (rankings_df['volatility'] > 40) | 
+    (rankings_df['volatility'] > 40) |
     (rankings_df['VaR_95'] > 10)
 ].sort_values('VaR_95', ascending=False)
 
 if not high_risk_stocks.empty:
     print("High Risk Stocks (>40% Ann. Vol or >10% VaR):")
-    for stock, row in high_risk_stocks.head(5).iterrows():
+    for stock in high_risk_stocks.head(5).index:
+        row = high_risk_stocks.loc[stock]
         print(f"  {stock}: Vol={row['volatility']:.1f}%, VaR={row['VaR_95']:.2f}%")
 
 # Suggested stop losses and take profits
 print("\n🎯 SUGGESTED STOP LOSSES & TAKE PROFITS (Top 5):\n")
-for stock, row in rankings_df.head(5).iterrows():
+for stock in rankings_df.head(5).index:
+    row = rankings_df.loc[stock]
     current = row['current_price']
     var_95 = row['VaR_95'] / 100
     upside_75 = row['max_upside'] / 100
-    
+
     stop_loss = current * (1 - var_95)
     take_profit = current * (1 + upside_75 * 0.7)  # 70% of max upside
-    
+
     print(f"{stock}:")
     print(f"  Current: ${current:.2f}")
     print(f"  Stop Loss (95% VaR): ${stop_loss:.2f} (-{var_95*100:.1f}%)")
@@ -1106,7 +1157,7 @@ for stock, row in rankings_df.head(5).iterrows():
 try:
     bt_file = 'stock_forecast_backtest.csv'
     today_stamp = pd.Timestamp.utcnow().normalize()
-    
+
     bt_rows = []
     for stock in rankings_df.index:
         bt_rows.append({
@@ -1121,67 +1172,76 @@ try:
             'actual_price_1m': np.nan,
             'forecast_accuracy': np.nan
         })
-    
+
     new_bt = pd.DataFrame(bt_rows)
-    
+
     # Load and update existing backtest data
     try:
-        old_bt = pd.read_csv(bt_file)
-        
+        # Use os.path.exists for checking file existence
+        if os.path.exists(bt_file):
+            old_bt = pd.read_csv(bt_file)
+        else:
+            old_bt = pd.DataFrame() # Initialize as empty if file doesn't exist
+
         # Fill in actual returns from 1 month ago
         one_month_ago = (today_stamp - pd.Timedelta(days=30)).date()
         mask_past = old_bt['date'] == str(one_month_ago)
-        
+
         if mask_past.any():
             for stock in old_bt[mask_past]['ticker'].unique():
                 if stock not in prices_df.columns:
                     continue
-                
+
                 try:
                     # Get actual 20-day return
                     price_then = old_bt.loc[mask_past & (old_bt['ticker'] == stock), 'current_price'].values[0]
                     price_now = prices_df[stock].iloc[-1]
                     actual_return = ((price_now - price_then) / price_then) * 100
-                    
+
                     idx = old_bt.index[mask_past & (old_bt['ticker'] == stock)]
                     if len(idx) > 0:
                         forecast_ret = old_bt.loc[idx[0], 'forecast_return_1m']
                         old_bt.loc[idx, 'actual_return_1m'] = actual_return
                         old_bt.loc[idx, 'actual_price_1m'] = price_now
-                        
+
                         if not pd.isna(forecast_ret):
                             error = abs(actual_return - forecast_ret)
                             old_bt.loc[idx, 'forecast_accuracy'] = 100 - min(error, 100)
                 except Exception:
                     pass
-        
-        bt_all = pd.concat([old_bt, new_bt], ignore_index=True)
-    except FileNotFoundError:
+
+        # Concatenate old and new data
+        if not old_bt.empty:
+            bt_all = pd.concat([old_bt, new_bt], ignore_index=True)
+        else:
+            bt_all = new_bt
+
+    except FileNotFoundError: # This block might not be strictly necessary with os.path.exists, but kept for robustness
         bt_all = new_bt
-    
+
     bt_all = bt_all.drop_duplicates(subset=['date', 'ticker'], keep='last')
     bt_all.to_csv(bt_file, index=False)
-    
+
     # Calculate overall accuracy
     completed = bt_all.dropna(subset=['forecast_return_1m', 'actual_return_1m'])
-    
+
     if len(completed) > 0:
         mae = abs(completed['forecast_return_1m'] - completed['actual_return_1m']).mean()
         rmse = np.sqrt(((completed['forecast_return_1m'] - completed['actual_return_1m'])**2).mean())
-        
+
         direction_correct = (
             np.sign(completed['forecast_return_1m']) == np.sign(completed['actual_return_1m'])
         ).mean()
-        
+
         avg_accuracy = completed['forecast_accuracy'].mean()
-        
+
         print("\n📈 Historical Forecast Performance:")
         print(f"   Forecasts Tracked: {len(completed)}")
         print(f"   Mean Absolute Error: {mae:.2f}%")
         print(f"   Root Mean Squared Error: {rmse:.2f}%")
         print(f"   Direction Accuracy: {direction_correct:.1%}")
         print(f"   Average Accuracy Score: {avg_accuracy:.1f}/100")
-        
+
         # Save accuracy metrics
         pd.DataFrame([{
             'date': str(today_stamp.date()),
@@ -1190,7 +1250,7 @@ try:
             'rmse': rmse,
             'direction_accuracy': direction_correct,
             'avg_accuracy_score': avg_accuracy
-        }]).to_csv('forecast_performance_history.csv', mode='a', header=not pd.io.common.file_exists('forecast_performance_history.csv'), index=False)
+        }]).to_csv('forecast_performance_history.csv', mode='a', header=not os.path.exists('forecast_performance_history.csv'), index=False)
 
 except Exception as e:
     print(f"Note: Backtest tracking error: {e}")
