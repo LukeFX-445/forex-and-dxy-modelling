@@ -252,7 +252,7 @@ oil_factors = {
     '1. Global Demand Growth': {
         'status': 'MODERATE',
         'key_metrics': {
-            'Oil-Equity Correlation': f"{corr_matrix.loc['SPY', oil_ticker]:.2f}" if oil_ticker in corr_matrix.columns else 'N/A',
+            'Oil-Equity Correlation': f"{corr_matrix.loc['SPY', oil_ticker]:.2f}" if (oil_ticker and 'SPY' in corr_matrix.index and oil_ticker in corr_matrix.columns) else 'N/A',
             'US/China/EM': 'Monitor industrial production & transport demand'
         },
         'impact': 'NEUTRAL',
@@ -261,11 +261,11 @@ oil_factors = {
     '2. OPEC+ Policy & Quota Compliance': {
         'status': 'CONSTRAINED SUPPLY',
         'key_metrics': {
-            'Current Price': f"${current_oil_price:.2f}/bbl",
-            'OPEC+ Cuts': '~2M bbl/day (as of late 2024)'
+            'Current Price': f"${current_oil_price:.2f}/bbl" if current_oil_price else 'N/A',
+            'Note': 'Monitor OPEC+ meeting decisions and compliance rates'
         },
         'impact': 'BULLISH',
-        'reasoning': 'OPEC+ production cuts (Saudi/Russia leadership) support prices; monitor compliance and cheating'
+        'reasoning': 'Production cuts by major producers support prices; monitor Saudi/Russia compliance'
     },
     '3. US Shale Production & Rig Counts': {
         'status': 'RISING SLOWLY',
@@ -454,7 +454,186 @@ gold_factors = {
         'key_metrics': {
             'GLD Holdings': 'Track daily for institutional flows',
             'Gold Miners (GDX) Corr': f"{macro_indicators.get('gold_miners_correlation', 0):.2f}",
-            'Miners Leverage': f"{macro_indicators.get('miners_leverage', 0):.2f}x" if 'miners_# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
+            'Miners Leverage': f"{macro_indicators.get('miners_leverage', 1.0):.2f}x"
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'GDX typically 2-3x leveraged to gold moves; track CFTC COT report for speculative positioning'
+    },
+    '10. Opportunity Cost vs Other Assets': {
+        'status': 'COMPETING WITH BONDS & CRYPTO',
+        'key_metrics': {
+            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
+            'Bitcoin 1M Return': f"{macro_indicators.get('bitcoin_return_1m', 0):.2f}%",
+            'Gold 1M Return': f"{macro_indicators.get('gold_return_1m', 0):.2f}%"
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Gold competes with bonds (yield), crypto (speculative store of value), and cash'
+    }
+}
+
+print("\n🥇 Gold Fundamental Drivers:")
+for factor, details in gold_factors.items():
+    print(f"\n{factor}")
+    print(f"  Status: {details['status']}")
+    if 'key_metrics' in details:
+        for metric, value in details['key_metrics'].items():
+            print(f"    • {metric}: {value}")
+    print(f"  Impact: {details['impact']}")
+    print(f"  → {details['reasoning']}")
+
+gold_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in gold_factors.values())
+print(f"\n📈 GOLD COMPOSITE MACRO SCORE: {gold_macro_score:+d}/{len(gold_factors)} factors")
+print(f"   Rating: {'BULLISH' if gold_macro_score > 2 else ('BEARISH' if gold_macro_score < -2 else 'NEUTRAL')}")
+
+# ============================================================================
+# COMPOSITE ANALYSIS & COMBINED SIGNALS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("COMPOSITE MACRO SCORES & COMBINED TRADING SIGNALS")
+print("=" * 80)
+
+macro_scores = {
+    'SPY': {
+        'score': spy_macro_score,
+        'total_factors': len(spy_factors),
+        'rating': 'BULLISH' if spy_macro_score > 2 else ('BEARISH' if spy_macro_score < -2 else 'NEUTRAL')
+    },
+    'QQQ': {
+        'score': qqq_macro_score,
+        'total_factors': len(qqq_factors),
+        'rating': 'BULLISH' if qqq_macro_score > 2 else ('BEARISH' if qqq_macro_score < -2 else 'NEUTRAL')
+    },
+    'CL=F': {
+        'score': oil_macro_score,
+        'total_factors': len(oil_factors),
+        'rating': 'BULLISH' if oil_macro_score > 2 else ('BEARISH' if oil_macro_score < -2 else 'NEUTRAL')
+    },
+    'GLD': {
+        'score': gold_macro_score,
+        'total_factors': len(gold_factors),
+        'rating': 'BULLISH' if gold_macro_score > 1 else ('BEARISH' if gold_macro_score < -1 else 'NEUTRAL')
+    }
+}
+
+print("\n📊 COMPREHENSIVE SIGNAL SUMMARY:")
+print("=" * 80)
+print("\nAsset | Macro Score | Macro Rating | ML Prediction | ML Conf | Combined Signal")
+print("-" * 95)
+
+for ticker in ['SPY', 'QQQ', 'CL=F', 'GLD']:
+    if ticker in forward_predictions and ticker in macro_scores:
+        ml_pred = forward_predictions[ticker]['prediction_direction']
+        ml_conf = forward_predictions[ticker]['confidence']
+        macro = macro_scores[ticker]
+        
+        # Combined signal: both macro and ML must agree for strong signal
+        if macro['rating'] == 'BULLISH' and ml_pred == 'UP' and ml_conf > 0.7:
+            combined = '🟢 STRONG BUY'
+        elif macro['rating'] == 'BEARISH' and ml_pred == 'DOWN/FLAT' and ml_conf > 0.7:
+            combined = '🔴 STRONG SELL'
+        elif macro['rating'] == 'BULLISH' or (ml_pred == 'UP' and ml_conf > 0.65):
+            combined = '🟢 MODERATE BUY'
+        elif macro['rating'] == 'BEARISH' or (ml_pred == 'DOWN/FLAT' and ml_conf > 0.65):
+            combined = '🔴 MODERATE SELL'
+        else:
+            combined = '🟡 HOLD / NEUTRAL'
+        
+        print(f"{ticker:5} | {macro['score']:+3d}/{macro['total_factors']:2d}      | {macro['rating']:12} | {ml_pred:13} | {ml_conf:6.1%} | {combined}")
+
+# Save comprehensive macro analysis
+macro_analysis_output = {
+    'timestamp': datetime.utcnow().isoformat(),
+    'market_regime': current_regime_name,
+    'oil_source': oil_source if oil_ticker_used else 'N/A',
+    'oil_price': float(current_oil_price) if current_oil_price else None,
+    'macro_indicators': {k: (float(v) if isinstance(v, (int, float, np.number)) else str(v)) 
+                        for k, v in macro_indicators.items()},
+    'spy_factors_summary': {
+        'score': spy_macro_score,
+        'total': len(spy_factors),
+        'rating': macro_scores['SPY']['rating']
+    },
+    'qqq_factors_summary': {
+        'score': qqq_macro_score,
+        'total': len(qqq_factors),
+        'rating': macro_scores['QQQ']['rating']
+    },
+    'oil_factors_summary': {
+        'score': oil_macro_score,
+        'total': len(oil_factors),
+        'rating': macro_scores['CL=F']['rating']
+    },
+    'gold_factors_summary': {
+        'score': gold_macro_score,
+        'total': len(gold_factors),
+        'rating': macro_scores['GLD']['rating']
+    },
+    'combined_signals': {
+        ticker: {
+            'macro_rating': macro_scores[ticker]['rating'],
+            'ml_prediction': forward_predictions[ticker]['prediction_direction'] if ticker in forward_predictions else 'N/A',
+            'ml_confidence': float(forward_predictions[ticker]['confidence']) if ticker in forward_predictions else None
+        }
+        for ticker in ['SPY', 'QQQ', 'CL=F', 'GLD']
+    }
+}
+
+with open('comprehensive_macro_analysis.json', 'w') as f:
+    json.dump(macro_analysis_output, f, indent=2)
+
+print("\n✅ Saved comprehensive fundamental analysis to comprehensive_macro_analysis.json")
+
+print("\n" + "=" * 80)
+print("KEY INSIGHTS & ACTION ITEMS")
+print("=" * 80)
+
+# Identify strongest opportunities
+best_opportunity = max(macro_scores.items(), key=lambda x: x[1]['score'])
+worst_opportunity = min(macro_scores.items(), key=lambda x: x[1]['score'])
+
+print(f"\n🏆 STRONGEST OPPORTUNITY: {best_opportunity[0]}")
+print(f"   Macro Score: {best_opportunity[1]['score']}/{best_opportunity[1]['total_factors']} ({best_opportunity[1]['rating']})")
+if best_opportunity[0] in forward_predictions:
+    print(f"   ML Prediction: {forward_predictions[best_opportunity[0]]['prediction_direction']} ({forward_predictions[best_opportunity[0]]['confidence']:.1%})")
+
+print(f"\n⚠️  WEAKEST OPPORTUNITY: {worst_opportunity[0]}")
+print(f"   Macro Score: {worst_opportunity[1]['score']}/{worst_opportunity[1]['total_factors']} ({worst_opportunity[1]['rating']})")
+if worst_opportunity[0] in forward_predictions:
+    print(f"   ML Prediction: {forward_predictions[worst_opportunity[0]]['prediction_direction']} ({forward_predictions[worst_opportunity[0]]['confidence']:.1%})")
+
+# Recession warning
+if macro_indicators.get('recession_risk') == 'High':
+    print(f"\n🚨 RECESSION WARNING:")
+    print(f"   Risk Level: {macro_indicators.get('recession_risk')}")
+    print(f"   Active Signals: {', '.join(macro_indicators.get('recession_signals', []))}")
+    print(f"   → Consider defensive positioning: reduce equity exposure, increase gold/bonds")
+
+# Rate environment
+if macro_indicators.get('fed_funds_rate', 0) > 5:
+    print(f"\n⚠️  HIGH RATE ENVIRONMENT:")
+    print(f"   Fed Funds: {macro_indicators.get('fed_funds_rate', 0):.2f}%")
+    print(f"   → Restrictive policy pressures valuations; favor quality over growth")
+
+print("\n" + "=" * 80)
+print("ANALYSIS COMPLETE - 16 SECTIONS")
+print("=" * 80)
+
+print("\n📁 Generated Files:")
+print("   - forward_predictions_5d.csv")
+print("   - backtest_performance.csv")
+print("   - asset_correlation_matrix.csv")
+print("   - rolling_correlations.csv")
+print("   - feature_importance_*.csv (per asset)")
+print("   - analysis_summary.json")
+print("   - comprehensive_macro_analysis.json")
+print("   - system_metadata.json")
+
+print("\n⚠️  Disclaimer: This analysis is for educational purposes only.")
+print("    Combine quantitative signals with fundamental analysis and your own research.")
+print("    Markets are dynamic - reassess regularly.")
+
+print("\nHappy Trading! 🚀📊")# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
 # Predicts: S&P 500, NASDAQ, Oil (CL=F), Gold with ML, regime detection, and macro signals
 # FIXED: All USO references removed, uses CL=F (WTI Crude Oil Futures) directly
 
@@ -596,25 +775,27 @@ for ticker, name in indicators.items():
     except Exception as e:
         continue
 
-if not asset_data:
-    print("\n❌ ERROR: Failed to download any asset data!")
-    raise SystemExit("Cannot proceed without data")
+print(f"\n✓ Collected data for {len(asset_data)} primary assets and {len(indicator_data)} indicators")
 
-# Display which oil ticker is being used
+# Display which oil ticker is being used - SAFE VERSION
 oil_ticker_used = None
+oil_source = None
+current_oil_price = None
+
 for ticker in asset_data.keys():
     if ticker in ['CL=F', 'BZ=F']:
         oil_ticker_used = ticker
         break
 
 if oil_ticker_used:
-    # Get current oil price
     current_oil_price = float(asset_data[oil_ticker_used]['Close'].iloc[-1])
     oil_source = "WTI Crude Oil Futures (CL=F)" if oil_ticker_used == 'CL=F' else "Brent Oil Futures (BZ=F)"
     print(f"\n💡 Oil Data Source: {oil_source}")
     print(f"💰 Current Oil Price: ${current_oil_price:.2f}")
+else:
+    print("\n⚠️  Oil Data: Not available")
 
-print(f"\n✓ Collected data for {len(asset_data)} primary assets and {len(indicator_data)} indicators")
+print(f"\n✓ All data collection complete")
 
 # ============================================================================
 # SECTION 2: DATA PREPROCESSING & FEATURE ENGINEERING
