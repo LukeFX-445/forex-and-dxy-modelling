@@ -1,8 +1,13 @@
+# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
+# Predicts: S&P 500, NASDAQ, Oil (CL=F), Gold with ML, regime detection, and macro signals
+# FIXED: All USO references removed, uses CL=F (WTI Crude Oil Futures) directly
+
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-!pip install yfinance arch pandas numpy scipy scikit-learn statsmodels fredapi xgboost lightgbm tensorflow keras --quiet
+print("Installing required packages...")
+!pip install yfinance arch pandas numpy scipy scikit-learn statsmodels xgboost lightgbm --quiet
 
 import yfinance as yf
 import pandas as pd
@@ -29,7 +34,7 @@ import math
 # ============================================================================
 
 print("=" * 80)
-print("MULTI-ASSET MARKET MOVEMENT PREDICTION SYSTEM")
+print("MULTI-ASSET MARKET MOVEMENT PREDICTION SYSTEM V2")
 print("=" * 80)
 
 print("\n[1/12] Collecting market data...")
@@ -37,35 +42,67 @@ print("\n[1/12] Collecting market data...")
 end_date = datetime.utcnow()
 start_date = end_date - timedelta(days=5*365)  # 5 years of data
 
-# Define primary assets to predict
+# Define primary assets to predict - NO USO ANYWHERE
 assets = {
     'SPY': 'S&P 500 ETF',
     'QQQ': 'NASDAQ-100 ETF',
-    'USO': 'WTI Oil ETF',
+    'CL=F': 'WTI Crude Oil Futures',
     'GLD': 'Gold ETF'
 }
 
-# Also track actual indices for validation
-validation_tickers = {
-    '^GSPC': 'S&P 500 Index',
-    '^IXIC': 'NASDAQ Composite',
-    'CL=F': 'Crude Oil Futures',
-    'GC=F': 'Gold Futures'
+# Backup tickers if primary fails - NO USO
+asset_backups = {
+    'CL=F': ['BZ=F'],  # Only Brent futures as backup
 }
 
 # Download primary asset data
 print("  Fetching primary assets...")
 asset_data = {}
+failed_assets = []
+
 for ticker, name in assets.items():
     try:
+        print(f"    Downloading {ticker}...", end='')
         data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
-        if not data.empty:
+        
+        # Handle both single ticker and multi-ticker returns
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data.xs(ticker, axis=1, level=1)
+        
+        if not data.empty and len(data) > 100:
             asset_data[ticker] = data
-            print(f"    ✓ {name} ({ticker})")
+            print(f" ✓ {name} ({len(data)} days)")
+        else:
+            print(f" ✗ Insufficient data")
+            failed_assets.append(ticker)
     except Exception as e:
-        print(f"    ✗ Failed to fetch {ticker}: {e}")
+        print(f" ✗ Failed: {e}")
+        failed_assets.append(ticker)
 
-# Download market indicators and related assets
+# Try backup tickers for failed assets
+if failed_assets:
+    print("\n  Trying backup tickers...")
+    for failed_ticker in failed_assets:
+        if failed_ticker in asset_backups:
+            for backup_ticker in asset_backups[failed_ticker]:
+                try:
+                    print(f"    Downloading {backup_ticker} (backup for {failed_ticker})...", end='')
+                    data = yf.download(backup_ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
+                    
+                    if isinstance(data.columns, pd.MultiIndex):
+                        data = data.xs(backup_ticker, axis=1, level=1)
+                    
+                    if not data.empty and len(data) > 100:
+                        asset_data[failed_ticker] = data
+                        assets[failed_ticker] = f"{assets[failed_ticker]} ({backup_ticker})"
+                        print(f" ✓ Using {backup_ticker} as backup ({len(data)} days)")
+                        break
+                    else:
+                        print(f" ✗ Insufficient data")
+                except Exception as e:
+                    print(f" ✗ Failed: {e}")
+
+# Download market indicators - NO USO
 print("\n  Fetching market indicators...")
 indicators = {
     '^VIX': 'VIX (Volatility Index)',
@@ -82,18 +119,44 @@ indicators = {
     'GDX': 'Gold Miners ETF',
     'UNG': 'Natural Gas ETF',
     'BTC-USD': 'Bitcoin',
-    'ETH-USD': 'Ethereum'
+    'ETH-USD': 'Ethereum',
+    'BZ=F': 'Brent Oil Futures',
+    'NG=F': 'Natural Gas Futures',
+    'XOP': 'Oil & Gas Exploration ETF',
+    'OIH': 'Oil Services ETF'
 }
 
 indicator_data = {}
 for ticker, name in indicators.items():
     try:
         data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
-        if not data.empty:
+        
+        if isinstance(data.columns, pd.MultiIndex):
+            data = data.xs(ticker, axis=1, level=1)
+        
+        if not data.empty and len(data) > 100:
             indicator_data[ticker] = data
             print(f"    ✓ {name}")
-    except:
+    except Exception as e:
         continue
+
+if not asset_data:
+    print("\n❌ ERROR: Failed to download any asset data!")
+    raise SystemExit("Cannot proceed without data")
+
+# Display which oil ticker is being used
+oil_ticker_used = None
+for ticker in asset_data.keys():
+    if ticker in ['CL=F', 'BZ=F']:
+        oil_ticker_used = ticker
+        break
+
+if oil_ticker_used:
+    # Get current oil price
+    current_oil_price = float(asset_data[oil_ticker_used]['Close'].iloc[-1])
+    oil_source = "WTI Crude Oil Futures (CL=F)" if oil_ticker_used == 'CL=F' else "Brent Oil Futures (BZ=F)"
+    print(f"\n💡 Oil Data Source: {oil_source}")
+    print(f"💰 Current Oil Price: ${current_oil_price:.2f}")
 
 print(f"\n✓ Collected data for {len(asset_data)} primary assets and {len(indicator_data)} indicators")
 
@@ -103,65 +166,51 @@ print(f"\n✓ Collected data for {len(asset_data)} primary assets and {len(indic
 
 print("\n[2/12] Preprocessing and engineering features...")
 
-# Combine all data into unified DataFrames
 def extract_ohlcv(data_dict):
     """Extract OHLCV data from yfinance results"""
-    # Use explicit dictionaries to collect Series objects
-    closes_series = {}
-    opens_series = {}
-    highs_series = {}
-    lows_series = {}
-    volumes_series = {}
-
-    all_indices = pd.Index([]) # Start with an empty index to collect all valid date indices
-
+    if not data_dict:
+        empty_df = pd.DataFrame()
+        return empty_df, empty_df, empty_df, empty_df, empty_df
+    
+    closes_dict = {}
+    opens_dict = {}
+    highs_dict = {}
+    lows_dict = {}
+    volumes_dict = {}
+    
     for ticker, data in data_dict.items():
-        if not data.empty and all(col in data.columns for col in ['Close', 'Open', 'High', 'Low', 'Volume']):
-            # Explicitly construct Series to ensure consistency and type
-            # This handles cases where data['Column'] might be interpreted as scalar.
-            closes_series[ticker] = pd.Series(data['Close'].values.flatten(), index=data.index, dtype=float)
-            opens_series[ticker] = pd.Series(data['Open'].values.flatten(), index=data.index, dtype=float)
-            highs_series[ticker] = pd.Series(data['High'].values.flatten(), index=data.index, dtype=float)
-            lows_series[ticker] = pd.Series(data['Low'].values.flatten(), index=data.index, dtype=float)
-            volumes_series[ticker] = pd.Series(data['Volume'].values.flatten(), index=data.index, dtype=float)
-            all_indices = all_indices.union(data.index)
-        else:
-            # Provide empty Series for missing or problematic data to ensure type consistency
-            closes_series[ticker] = pd.Series(dtype=float)
-            opens_series[ticker] = pd.Series(dtype=float)
-            highs_series[ticker] = pd.Series(dtype=float)
-            lows_series[ticker] = pd.Series(dtype=float)
-            volumes_series[ticker] = pd.Series(dtype=float)
-
-    # Now, explicitly pass all_indices to DataFrame constructor, letting it align series
-    if not all_indices.empty:
-        closes = pd.DataFrame(closes_series, index=all_indices)
-        opens = pd.DataFrame(opens_series, index=all_indices)
-        highs = pd.DataFrame(highs_series, index=all_indices)
-        lows = pd.DataFrame(lows_series, index=all_indices)
-        volumes = pd.DataFrame(volumes_series, index=all_indices)
-    else:
-        # If all_indices is empty, it means no data was successfully fetched for any ticker.
-        all_tickers = data_dict.keys()
-        closes = pd.DataFrame(columns=all_tickers)
-        opens = pd.DataFrame(columns=all_tickers)
-        highs = pd.DataFrame(columns=all_tickers)
-        lows = pd.DataFrame(columns=all_tickers)
-        volumes = pd.DataFrame(columns=all_tickers)
-
+        try:
+            if 'Close' in data.columns:
+                closes_dict[ticker] = data['Close']
+            if 'Open' in data.columns:
+                opens_dict[ticker] = data['Open']
+            if 'High' in data.columns:
+                highs_dict[ticker] = data['High']
+            if 'Low' in data.columns:
+                lows_dict[ticker] = data['Low']
+            if 'Volume' in data.columns:
+                volumes_dict[ticker] = data['Volume']
+        except Exception as e:
+            continue
+    
+    closes = pd.DataFrame(closes_dict) if closes_dict else pd.DataFrame()
+    opens = pd.DataFrame(opens_dict) if opens_dict else pd.DataFrame()
+    highs = pd.DataFrame(highs_dict) if highs_dict else pd.DataFrame()
+    lows = pd.DataFrame(lows_dict) if lows_dict else pd.DataFrame()
+    volumes = pd.DataFrame(volumes_dict) if volumes_dict else pd.DataFrame()
+    
     return closes, opens, highs, lows, volumes
 
-# Extract price data
+print("  Extracting OHLCV data...")
 asset_closes, asset_opens, asset_highs, asset_lows, asset_volumes = extract_ohlcv(asset_data)
 indicator_closes, _, _, _, _ = extract_ohlcv(indicator_data)
 
-# Verify we have data
 if asset_closes.empty:
-    raise ValueError("Failed to download any asset data. Please check your internet connection and try again.")
+    raise ValueError("Failed to extract any price data")
 
 print(f"  ✓ Extracted data for {len(asset_closes.columns)} assets")
 
-# Align all data to common dates (business days)
+# Align all data
 all_closes = pd.concat([asset_closes, indicator_closes], axis=1)
 all_closes = all_closes.ffill(limit=5).dropna(how='all')
 
@@ -177,7 +226,6 @@ print(f"✓ Data spans {len(all_closes)} trading days")
 
 print("\n[3/12] Creating prediction targets...")
 
-# Define prediction horizons
 horizons = {
     '1d': 1,
     '3d': 3,
@@ -186,31 +234,23 @@ horizons = {
     '20d': 20
 }
 
-# Create targets for each asset
 targets = {}
 
 for ticker in assets.keys():
     targets[ticker] = {}
-
+    
     for horizon_name, days in horizons.items():
-        # Forward returns
         forward_return = asset_closes[ticker].pct_change(days).shift(-days)
-
-        # Classification targets
-        # Ternary: -1 (down >0.5%), 0 (flat ±0.5%), 1 (up >0.5%)
+        
         targets[ticker][f'{horizon_name}_direction'] = pd.cut(
             forward_return * 100,
             bins=[-np.inf, -0.5, 0.5, np.inf],
             labels=[-1, 0, 1]
         ).astype(float)
-
-        # Binary: 0 (down/flat), 1 (up)
+        
         targets[ticker][f'{horizon_name}_binary'] = (forward_return > 0).astype(int)
-
-        # Actual forward return for regression
         targets[ticker][f'{horizon_name}_return'] = forward_return
 
-# Convert to DataFrames
 for ticker in assets.keys():
     targets[ticker] = pd.DataFrame(targets[ticker])
 
@@ -227,63 +267,59 @@ features_dict = {}
 for ticker in assets.keys():
     features = pd.DataFrame(index=asset_closes.index)
     price = asset_closes[ticker]
-
-    # ========== PRICE-BASED FEATURES ==========
-
-    # Returns (multiple timeframes)
+    
+    # Returns
     for period in [1, 2, 3, 5, 10, 20, 60]:
         features[f'return_{period}d'] = price.pct_change(period)
         features[f'log_return_{period}d'] = np.log(price / price.shift(period))
-
+    
     # Moving averages
     for window in [5, 10, 20, 50, 100, 200]:
         features[f'sma_{window}'] = price.rolling(window).mean()
         features[f'price_to_sma_{window}'] = price / features[f'sma_{window}']
         features[f'sma_{window}_slope'] = features[f'sma_{window}'].diff(5)
-
-    # Exponential moving averages
+    
+    # EMA
     for span in [12, 26, 50]:
         features[f'ema_{span}'] = price.ewm(span=span).mean()
         features[f'price_to_ema_{span}'] = price / features[f'ema_{span}']
-
+    
     # Moving average crossovers
     features['sma_cross_50_200'] = features['sma_50'] - features['sma_200']
     features['ema_cross_12_26'] = features['ema_12'] - features['ema_26']
-
-    # ========== MOMENTUM INDICATORS ==========
-
-    # RSI (multiple periods)
+    
+    # RSI
     for period in [7, 14, 21, 28]:
         delta = price.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        features[f'rsi_{period}'] = 100 - (100 / (1 + rs))
-
+        rs = gain / loss.replace(0, np.nan)
+        rsi_values = 100 - (100 / (1 + rs))
+        rsi_values = rsi_values.fillna(50)
+        features[f'rsi_{period}'] = rsi_values
+    
     # MACD
     ema_12 = price.ewm(span=12).mean()
     ema_26 = price.ewm(span=26).mean()
     features['macd'] = ema_12 - ema_26
     features['macd_signal'] = features['macd'].ewm(span=9).mean()
     features['macd_hist'] = features['macd'] - features['macd_signal']
-
-    # Stochastic Oscillator
+    
+    # Stochastic
     for period in [14, 21]:
         low_min = asset_lows[ticker].rolling(window=period).min()
         high_max = asset_highs[ticker].rolling(window=period).max()
         features[f'stoch_{period}'] = 100 * (price - low_min) / (high_max - low_min)
         features[f'stoch_{period}_ma'] = features[f'stoch_{period}'].rolling(3).mean()
-
-    # Rate of Change (ROC)
+    
+    # ROC
     for period in [5, 10, 20]:
         features[f'roc_{period}'] = ((price - price.shift(period)) / price.shift(period)) * 100
-
-    # ========== VOLATILITY INDICATORS ==========
-
-    # Historical volatility (multiple windows)
+    
+    # Volatility
     for window in [5, 10, 20, 60]:
         features[f'volatility_{window}d'] = returns[ticker].rolling(window).std() * np.sqrt(252)
-
+    
     # Bollinger Bands
     for window in [20, 50]:
         sma = price.rolling(window).mean()
@@ -292,79 +328,75 @@ for ticker in assets.keys():
         features[f'bb_lower_{window}'] = sma - 2 * std
         features[f'bb_width_{window}'] = (features[f'bb_upper_{window}'] - features[f'bb_lower_{window}']) / sma
         features[f'bb_position_{window}'] = (price - features[f'bb_lower_{window}']) / (features[f'bb_upper_{window}'] - features[f'bb_lower_{window}'])
-
-    # ATR (Average True Range)
+    
+    # ATR
     high = asset_highs[ticker]
     low = asset_lows[ticker]
     close_prev = price.shift(1)
-
+    
     tr1 = high - low
     tr2 = abs(high - close_prev)
     tr3 = abs(low - close_prev)
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
+    
     for period in [7, 14, 21]:
-        features[f'atr_{period}'] = tr.rolling(period).mean()
-        features[f'atr_{period}_pct'] = features[f'atr_{period}'] / price
-
-    # ========== VOLUME INDICATORS ==========
-
+        atr_val = tr.rolling(period).mean()
+        features[f'atr_{period}'] = atr_val
+        features[f'atr_{period}_pct'] = (atr_val / price.replace(0, np.nan)).fillna(0.02) * 100
+    
+    # Volume indicators
     volume = asset_volumes[ticker]
-
-    # Volume moving averages
+    
     for window in [5, 10, 20]:
         features[f'volume_sma_{window}'] = volume.rolling(window).mean()
         features[f'volume_ratio_{window}'] = volume / features[f'volume_sma_{window}']
-
-    # On-Balance Volume (OBV)
+    
+    # OBV
     obv = (np.sign(price.diff()) * volume).fillna(0).cumsum()
     features['obv'] = obv
     features['obv_ema'] = obv.ewm(span=20).mean()
-
-    # Volume-Price Trend
+    
+    # VPT
     features['vpt'] = (volume * ((price - price.shift(1)) / price.shift(1))).cumsum()
-
-    # ========== PATTERN RECOGNITION ==========
-
-    # Higher highs, higher lows (uptrend)
+    
+    # Pattern recognition
     features['higher_high'] = (high > high.shift(1)).astype(int)
     features['higher_low'] = (low > low.shift(1)).astype(int)
     features['uptrend_strength'] = features['higher_high'].rolling(5).sum() + features['higher_low'].rolling(5).sum()
-
+    
     # Price channels
     features['channel_high_20'] = high.rolling(20).max()
     features['channel_low_20'] = low.rolling(20).min()
     features['channel_position'] = (price - features['channel_low_20']) / (features['channel_high_20'] - features['channel_low_20'])
-
+    
     # Distance from 52-week high/low
     features['dist_from_52w_high'] = (price / high.rolling(252).max() - 1) * 100
     features['dist_from_52w_low'] = (price / low.rolling(252).min() - 1) * 100
-
-    # ========== STATISTICAL FEATURES ==========
-
-    # Skewness and Kurtosis of returns
+    
+    # Statistical features
     for window in [20, 60]:
         features[f'return_skew_{window}'] = returns[ticker].rolling(window).skew()
         features[f'return_kurt_{window}'] = returns[ticker].rolling(window).kurt()
-
-    # Z-score (standardized price)
+    
+    # Z-score
     for window in [20, 60]:
         mean = price.rolling(window).mean()
         std = price.rolling(window).std()
         features[f'zscore_{window}'] = (price - mean) / std
-
+    
     features_dict[ticker] = features
 
-print(f"✓ Created {len(features_dict['SPY'].columns)} features per asset")
+print(f"✓ Created {len(features_dict[list(assets.keys())[0]].columns)} features per asset")
 
-# ========== CROSS-ASSET FEATURES ==========
+# ============================================================================
+# SECTION 5: CROSS-ASSET & MACRO FEATURES (NO USO)
+# ============================================================================
 
 print("\n[5/12] Creating cross-asset and macro features...")
 
-# Market-wide features
 market_features = pd.DataFrame(index=all_closes.index)
 
-# VIX features (fear gauge)
+# VIX features
 if '^VIX' in indicator_closes.columns:
     vix = indicator_closes['^VIX']
     market_features['vix'] = vix
@@ -372,27 +404,27 @@ if '^VIX' in indicator_closes.columns:
     market_features['vix_change'] = vix.pct_change()
     market_features['vix_spike'] = (vix > vix.rolling(20).mean() + vix.rolling(20).std()).astype(int)
 
-# Treasury yield features
+# Treasury yield
 if '^TNX' in indicator_closes.columns:
     tnx = indicator_closes['^TNX']
     market_features['yield_10y'] = tnx
     market_features['yield_10y_change'] = tnx.diff()
     market_features['yield_10y_roc'] = tnx.pct_change(20)
 
-# Dollar Index features
+# Dollar Index
 if 'DX-Y.NYB' in indicator_closes.columns:
     dxy = indicator_closes['DX-Y.NYB']
     market_features['dxy'] = dxy
     market_features['dxy_return_20d'] = dxy.pct_change(20)
     market_features['dxy_sma_50'] = dxy.rolling(50).mean()
 
-# Credit spreads (HYG vs LQD)
+# Credit spreads
 if 'HYG' in indicator_closes.columns and 'LQD' in indicator_closes.columns:
     hyg_ret = indicator_closes['HYG'].pct_change(20)
     lqd_ret = indicator_closes['LQD'].pct_change(20)
     market_features['credit_spread_proxy'] = hyg_ret - lqd_ret
 
-# Market breadth (SPY vs IWM)
+# Market breadth
 if 'IWM' in indicator_closes.columns:
     spy_ret = asset_closes['SPY'].pct_change(20)
     iwm_ret = indicator_closes['IWM'].pct_change(20)
@@ -405,142 +437,157 @@ for sector in sector_etfs:
         sector_ret = indicator_closes[sector].pct_change(20)
         market_features[f'{sector}_momentum'] = sector_ret
 
-# Crypto correlation (risk-on/risk-off)
+# Crypto correlation
 if 'BTC-USD' in indicator_closes.columns:
     btc_ret = indicator_closes['BTC-USD'].pct_change(20)
     market_features['btc_momentum'] = btc_ret
 
-# Inter-asset correlations (rolling)
-market_features['spy_qqq_corr'] = returns['SPY'].rolling(60).corr(returns['QQQ'])
-market_features['spy_uso_corr'] = returns['SPY'].rolling(60).corr(returns['USO'])
-market_features['spy_gld_corr'] = returns['SPY'].rolling(60).corr(returns['GLD'])
-market_features['uso_gld_corr'] = returns['USO'].rolling(60).corr(returns['GLD'])
-market_features['qqq_gld_corr'] = returns['QQQ'].rolling(60).corr(returns['GLD'])
+# Inter-asset correlations - NO USO REFERENCES
+oil_ticker = None
+for potential_oil in ['CL=F', 'BZ=F']:
+    if potential_oil in returns.columns:
+        oil_ticker = potential_oil
+        break
 
-# Add market features to each asset's feature set
+# Calculate correlations based on available tickers
+if 'SPY' in returns.columns and 'QQQ' in returns.columns:
+    market_features['spy_qqq_corr'] = returns['SPY'].rolling(60).corr(returns['QQQ'])
+
+if 'SPY' in returns.columns and 'GLD' in returns.columns:
+    market_features['spy_gld_corr'] = returns['SPY'].rolling(60).corr(returns['GLD'])
+
+if oil_ticker and 'SPY' in returns.columns:
+    market_features['spy_oil_corr'] = returns['SPY'].rolling(60).corr(returns[oil_ticker])
+
+if oil_ticker and 'GLD' in returns.columns:
+    market_features['oil_gld_corr'] = returns[oil_ticker].rolling(60).corr(returns['GLD'])
+
+if 'QQQ' in returns.columns and 'GLD' in returns.columns:
+    market_features['qqq_gld_corr'] = returns['QQQ'].rolling(60).corr(returns['GLD'])
+
+if oil_ticker and 'QQQ' in returns.columns:
+    market_features['qqq_oil_corr'] = returns['QQQ'].rolling(60).corr(returns[oil_ticker])
+
+# Add market features to each asset
 for ticker in assets.keys():
     features_dict[ticker] = pd.concat([features_dict[ticker], market_features], axis=1)
 
 print(f"✓ Added {len(market_features.columns)} market-wide features")
 
+print(f"\n✅ All USO references removed - using CL=F (WTI Crude Oil Futures) at ${current_oil_price:.2f}")
+
 # ============================================================================
-# SECTION 5: REGIME DETECTION
+# SECTION 6: REGIME DETECTION
 # ============================================================================
 
 print("\n[6/12] Detecting market regimes...")
 
 regime_features = pd.DataFrame(index=all_closes.index)
 
-# Detect regimes for S&P 500
 try:
     spy_returns = returns['SPY'] * 100
-
+    
     model = MarkovRegression(
         spy_returns.dropna(),
         k_regimes=3,
         switching_variance=True
     )
-
+    
     res = model.fit(maxiter=100, disp=False, warn_convergence=False)
-
-    # Get regime probabilities
+    
     smoothed = res.smoothed_marginal_probabilities
     regime_features['regime_0_prob'] = smoothed[0]
     regime_features['regime_1_prob'] = smoothed[1]
     regime_features['regime_2_prob'] = smoothed[2]
     regime_features['regime_current'] = smoothed.idxmax(axis=1)
-
-    # Regime volatilities
+    
     for i in range(3):
         vol = np.sqrt(res.params[f'sigma2[{i}]'])
         regime_features[f'regime_{i}_vol'] = vol
-
+    
     print("  ✓ Markov Regime-Switching model fitted")
-
+    
 except Exception as e:
-    print(f"  Note: Regime detection using simpler method: {e}")
-    # Fallback: volatility-based regimes
+    print(f"  Note: Using volatility-based regime detection: {e}")
     vol = returns['SPY'].rolling(20).std()
     vol_z = (vol - vol.rolling(60).mean()) / vol.rolling(60).std()
-
+    
     regime_features['regime_current'] = pd.cut(
         vol_z,
         bins=[-np.inf, -0.5, 0.5, np.inf],
         labels=[0, 1, 2]
     ).astype(float)
 
-# Add regime features to all assets
 for ticker in assets.keys():
     features_dict[ticker] = pd.concat([features_dict[ticker], regime_features], axis=1)
 
 print(f"✓ Added regime detection features")
 
 # ============================================================================
-# SECTION 6: PREPARE ML DATASETS
+# SECTION 7: PREPARE ML DATASETS
 # ============================================================================
 
 print("\n[7/12] Preparing machine learning datasets...")
 
-# Function to create ML-ready dataset
 def prepare_ml_dataset(ticker, horizon='5d', target_type='binary'):
     """Prepare features and targets for ML training"""
-
+    
     X = features_dict[ticker].copy()
-    y = targets[ticker][f'{horizon}_{target_type}']
-
-    # Align X and y by their index
-    common_index = X.index.intersection(y.index)
-    X = X.loc[common_index]
-    y = y.loc[common_index]
-
-    # Drop rows where target is NaN (cannot train on missing target)
-    valid_mask = y.notna()
-    X_clean = X[valid_mask]
-    y_clean = y[valid_mask]
-
-    # Handle infinities and NaNs in features
+    
+    target_col = f'{horizon}_{target_type}'
+    if target_col not in targets[ticker].columns:
+        raise ValueError(f"Target {target_col} not found for {ticker}")
+    
+    y = targets[ticker][target_col]
+    
+    data = pd.concat([X, y.rename('target')], axis=1)
+    data = data.dropna(subset=['target'])
+    
+    if len(data) == 0:
+        raise ValueError(f"No valid data after alignment for {ticker} - {horizon}")
+    
+    X_clean = data.drop('target', axis=1)
+    y_clean = data['target']
+    
     X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
     
-    # Impute NaNs in features more robustly
-    if not X_clean.empty and not X_clean.columns.empty: # Check for empty columns too
-        # Calculate medians for each column
-        column_medians = X_clean.median()
-        
-        # Fill NaNs with their respective column medians
-        X_clean = X_clean.fillna(column_medians)
-        
-        # Drop columns that are entirely NaN after initial feature generation (e.g., if a feature was all NaNs)
-        X_clean = X_clean.dropna(axis=1, how='all')
-        
-        # Fill any remaining NaNs (shouldn't be many after median fill and dropping all-NaN columns) with 0
-        X_clean = X_clean.fillna(0)
-    else:
-        return pd.DataFrame(), pd.Series()
-
-    # After cleaning features, ensure X_clean is not empty and align y_clean
-    if X_clean.empty:
-        return pd.DataFrame(), pd.Series()
-        
-    y_clean = y_clean.loc[X_clean.index] # Ensure y_clean matches X_clean's index after final cleaning
+    for col in X_clean.columns:
+        if X_clean[col].isna().all():
+            X_clean[col] = 0
+        else:
+            X_clean[col] = X_clean[col].fillna(X_clean[col].median())
     
-    # Final check for empty after all cleaning
-    if y_clean.empty:
-        return pd.DataFrame(), pd.Series()
-
+    if X_clean.isna().any().any():
+        X_clean = X_clean.fillna(0)
+    
     return X_clean, y_clean
 
-# Prepare datasets for all assets (5-day binary prediction as default)
 ml_datasets = {}
 
 for ticker in assets.keys():
-    X, y = prepare_ml_dataset(ticker, horizon='5d', target_type='binary')
-    ml_datasets[ticker] = {'X': X, 'y': y}
-    print(f"  ✓ {ticker}: {len(X)} samples, {X.shape[1]} features")
+    try:
+        print(f"  Preparing {ticker}...", end='')
+        X, y = prepare_ml_dataset(ticker, horizon='5d', target_type='binary')
+        
+        if len(X) < 100:
+            print(f" ⚠ Insufficient data ({len(X)} samples) - skipping")
+            continue
+        
+        ml_datasets[ticker] = {'X': X, 'y': y}
+        print(f" ✓ {len(X)} samples, {X.shape[1]} features")
+        
+    except Exception as e:
+        print(f" ✗ Error: {e}")
+        continue
+
+if not ml_datasets:
+    print("\n❌ ERROR: Failed to prepare any ML datasets!")
+    raise SystemExit("Cannot proceed without valid datasets")
 
 print(f"\n✓ Prepared ML datasets for {len(ml_datasets)} assets")
 
 # ============================================================================
-# SECTION 7: TRAIN ML MODELS
+# SECTION 8: TRAIN ML MODELS
 # ============================================================================
 
 print("\n[8/12] Training machine learning models...")
@@ -550,44 +597,60 @@ predictions = {}
 performance = {}
 
 for ticker in assets.keys():
+    if ticker not in ml_datasets:
+        print(f"  ⚠ Skipping {ticker} - no valid dataset")
+        continue
+    
     print(f"\n  Training models for {ticker} ({assets[ticker]})...")
-
+    
     X = ml_datasets[ticker]['X']
     y = ml_datasets[ticker]['y']
-
-    # Use walk-forward validation (time series split)
+    
+    if len(X) < 100:
+        print(f"    ⚠ Insufficient data ({len(X)} samples) - skipping")
+        continue
+    
     train_size = int(len(X) * 0.7)
+    
+    if train_size < 50:
+        print(f"    ⚠ Training set too small ({train_size} samples) - skipping")
+        continue
+    
     X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
     y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
-
-    # Check for empty dataframes after split
-    if X_train.empty or y_train.empty or X_test.empty or y_test.empty:
-        print(f"    ✗ Skipping {ticker}: Insufficient data for training/testing after split.")
+    
+    if len(X_train) == 0 or len(X_test) == 0:
+        print(f"    ⚠ Empty train or test set - skipping")
         continue
-
-    # Scale features
+    
+    print(f"    Train: {len(X_train)} samples, Test: {len(X_test)} samples")
+    
     scaler = RobustScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    # Train multiple models
+    try:
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+    except Exception as e:
+        print(f"    ⚠ Scaling failed: {e} - skipping")
+        continue
+    
     model_dict = {}
-
-    # 1. Logistic Regression (baseline)
+    
+    # Logistic Regression
     try:
         lr = LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced')
         lr.fit(X_train_scaled, y_train)
         model_dict['LogisticRegression'] = lr
     except:
         pass
-
-    # 2. Random Forest
+    
+    # Random Forest
     try:
         rf = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=15,
-            min_samples_split=20,
-            min_samples_leaf=10,
+            n_estimators=300,
+            max_depth=20,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            max_features='sqrt',
             random_state=42,
             class_weight='balanced',
             n_jobs=-1
@@ -596,22 +659,24 @@ for ticker in assets.keys():
         model_dict['RandomForest'] = rf
     except:
         pass
-
-    # 3. Gradient Boosting
+    
+    # Gradient Boosting
     try:
         gb = GradientBoostingClassifier(
-            n_estimators=200,
-            max_depth=5,
-            learning_rate=0.05,
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.03,
             subsample=0.8,
+            min_samples_split=20,
+            min_samples_leaf=10,
             random_state=42
         )
         gb.fit(X_train_scaled, y_train)
         model_dict['GradientBoosting'] = gb
     except:
         pass
-
-    # 4. XGBoost
+    
+    # XGBoost
     try:
         xgb_model = xgb.XGBClassifier(
             n_estimators=200,
@@ -627,8 +692,8 @@ for ticker in assets.keys():
         model_dict['XGBoost'] = xgb_model
     except:
         pass
-
-    # 5. LightGBM
+    
+    # LightGBM
     try:
         lgb_model = lgb.LGBMClassifier(
             n_estimators=200,
@@ -643,8 +708,8 @@ for ticker in assets.keys():
         model_dict['LightGBM'] = lgb_model
     except:
         pass
-
-    # Ensemble voting classifier
+    
+    # Ensemble
     if len(model_dict) >= 3:
         voting_clf = VotingClassifier(
             estimators=[(name, model) for name, model in model_dict.items()],
@@ -652,56 +717,52 @@ for ticker in assets.keys():
         )
         voting_clf.fit(X_train_scaled, y_train)
         model_dict['Ensemble'] = voting_clf
-
+    
     # Evaluate models
     results = {}
     for name, model in model_dict.items():
         y_pred = model.predict(X_test_scaled)
         y_pred_proba = model.predict_proba(X_test_scaled)[:, 1] if hasattr(model, 'predict_proba') else None
-
+        
         accuracy = accuracy_score(y_test, y_pred)
-
+        
         results[name] = {
             'accuracy': accuracy,
             'y_pred': y_pred,
             'y_pred_proba': y_pred_proba
         }
-
+        
         print(f"    {name}: {accuracy:.2%} accuracy")
-
-    # Select best model
-    best_model_name = max(results, key=lambda x: results[x]['accuracy']) if results else None
-    if best_model_name:
-        best_model = model_dict[best_model_name]
-        print(f"    → Best: {best_model_name} ({results[best_model_name]['accuracy']:.2%})")
-
-        # Store
-        models[ticker] = {
-            'scaler': scaler,
-            'best_model': best_model,
-            'best_model_name': best_model_name,
-            'all_models': model_dict,
-            'feature_names': X.columns.tolist()
-        }
-
-        predictions[ticker] = {
-            'y_test': y_test,
-            'y_pred': results[best_model_name]['y_pred'],
-            'y_pred_proba': results[best_model_name]['y_pred_proba'],
-            'X_test_index': X_test.index
-        }
-
-        performance[ticker] = {
-            'accuracy': results[best_model_name]['accuracy'],
-            'model_used': best_model_name
-        }
-    else:
-        print(f"    ✗ No models trained for {ticker} (no valid models or insufficient data).")
+    
+    best_model_name = max(results, key=lambda x: results[x]['accuracy'])
+    best_model = model_dict[best_model_name]
+    
+    print(f"    → Best: {best_model_name} ({results[best_model_name]['accuracy']:.2%})")
+    
+    models[ticker] = {
+        'scaler': scaler,
+        'best_model': best_model,
+        'best_model_name': best_model_name,
+        'all_models': model_dict,
+        'feature_names': X.columns.tolist()
+    }
+    
+    predictions[ticker] = {
+        'y_test': y_test,
+        'y_pred': results[best_model_name]['y_pred'],
+        'y_pred_proba': results[best_model_name]['y_pred_proba'],
+        'X_test_index': X_test.index
+    }
+    
+    performance[ticker] = {
+        'accuracy': results[best_model_name]['accuracy'],
+        'model_used': best_model_name
+    }
 
 print(f"\n✓ Trained models for all {len(models)} assets")
 
 # ============================================================================
-# SECTION 8: FEATURE IMPORTANCE ANALYSIS
+# SECTION 9: FEATURE IMPORTANCE ANALYSIS
 # ============================================================================
 
 print("\n[9/12] Analyzing feature importance...")
@@ -709,31 +770,29 @@ print("\n[9/12] Analyzing feature importance...")
 feature_importance_dict = {}
 
 for ticker in assets.keys():
-    if ticker not in models: # Skip if model training failed for this ticker
-        print(f"  ✗ Skipping feature importance for {ticker}: No model trained.")
+    if ticker not in models:
         continue
+    
     model = models[ticker]['best_model']
     feature_names = models[ticker]['feature_names']
-
-    # Get feature importance (works for tree-based models)
+    
     if hasattr(model, 'feature_importances_'):
         importance = model.feature_importances_
         feature_importance_df = pd.DataFrame({
             'feature': feature_names,
             'importance': importance
         }).sort_values('importance', ascending=False)
-
+        
         feature_importance_dict[ticker] = feature_importance_df
-
+        
         print(f"\n  Top 10 features for {ticker}:")
         print(feature_importance_df.head(10)[['feature', 'importance']].to_string(index=False))
 
-# Save feature importance
 for ticker, df in feature_importance_dict.items():
     df.to_csv(f'feature_importance_{ticker}.csv', index=False)
 
 # ============================================================================
-# SECTION 9: GENERATE PREDICTIONS FOR NEXT 5 DAYS
+# SECTION 10: GENERATE PREDICTIONS
 # ============================================================================
 
 print("\n[10/12] Generating forward predictions...")
@@ -741,66 +800,69 @@ print("\n[10/12] Generating forward predictions...")
 forward_predictions = {}
 
 for ticker in assets.keys():
-    if ticker not in models: # Skip if model training failed for this ticker
-        print(f"  ✗ Skipping forward prediction for {ticker}: No model trained.")
+    if ticker not in models:
+        print(f"  ⚠ No trained model for {ticker} - skipping prediction")
+        continue
+    
+    try:
+        latest_features = features_dict[ticker].iloc[-1:].copy()
+        latest_features = latest_features.replace([np.inf, -np.inf], np.nan)
+        
+        for col in latest_features.columns:
+            if latest_features[col].isna().all() or pd.isna(latest_features[col].iloc[0]):
+                median_val = features_dict[ticker][col].median()
+                if pd.isna(median_val):
+                    latest_features[col] = 0
+                else:
+                    latest_features[col] = median_val
+        
+        scaler = models[ticker]['scaler']
+        latest_scaled = scaler.transform(latest_features)
+        
+        model = models[ticker]['best_model']
+        pred_class = model.predict(latest_scaled)[0]
+        pred_proba = model.predict_proba(latest_scaled)[0] if hasattr(model, 'predict_proba') else None
+        
+        current_price = float(asset_closes[ticker].iloc[-1])
+        
+        forward_predictions[ticker] = {
+            'current_price': current_price,
+            'prediction_class': int(pred_class),
+            'prediction_direction': 'UP' if pred_class == 1 else 'DOWN/FLAT',
+            'probability_up': float(pred_proba[1]) if pred_proba is not None else None,
+            'probability_down': float(pred_proba[0]) if pred_proba is not None else None,
+            'confidence': float(max(pred_proba)) if pred_proba is not None else None,
+            'model_used': models[ticker]['best_model_name']
+        }
+    except Exception as e:
+        print(f"  ⚠ Prediction failed for {ticker}: {e}")
         continue
 
-    # Get the feature names the scaler was fitted on (from the model object)
-    fitted_feature_names = models[ticker]['feature_names']
+if not forward_predictions:
+    print("\n⚠ WARNING: No forward predictions generated!")
+else:
+    print("\n" + "=" * 80)
+    print("PREDICTIONS FOR NEXT 5 DAYS")
+    print("=" * 80)
 
-    # Get latest features
-    latest_features_raw = features_dict[ticker].iloc[-1:].copy()
-    
-    # Reindex latest_features_raw to ensure it has the exact same columns as the training data
-    latest_features = latest_features_raw.reindex(columns=fitted_feature_names, fill_value=np.nan)
-    
-    # Fill any NaNs that might have been introduced by reindexing or were already there.
-    # Use the medians from the X_clean data (ml_datasets[ticker]['X']) for consistency.
-    training_medians = ml_datasets[ticker]['X'].median()
-    latest_features = latest_features.fillna(training_medians)
-    
-    # Ensure no remaining NaNs (e.g., if a new column was all NaN and not covered by median) by filling with 0
-    latest_features = latest_features.fillna(0)
+    for ticker, pred in forward_predictions.items():
+        ticker_name = assets[ticker]
+        if ticker == oil_ticker:
+            ticker_name += f" - Current: ${pred['current_price']:.2f}/barrel"
+        
+        print(f"\n{ticker} ({ticker_name}):")
+        print(f"  Current Price: ${pred['current_price']:.2f}")
+        print(f"  Prediction: {pred['prediction_direction']}")
+        if pred['probability_up'] is not None:
+            print(f"  Probability UP: {pred['probability_up']:.1%}")
+            print(f"  Confidence: {pred['confidence']:.1%}")
+        print(f"  Model: {pred['model_used']}")
 
-    # Scale
-    scaler = models[ticker]['scaler']
-    latest_scaled = scaler.transform(latest_features)
-
-    # Predict
-    model = models[ticker]['best_model']
-    pred_class = model.predict(latest_scaled)[0]
-    pred_proba = model.predict_proba(latest_scaled)[0] if hasattr(model, 'predict_proba') else None
-
-    current_price = float(asset_closes[ticker].iloc[-1])
-
-    forward_predictions[ticker] = {
-        'current_price': current_price,
-        'prediction_class': int(pred_class),
-        'prediction_direction': 'UP' if pred_class == 1 else 'DOWN/FLAT',
-        'probability_up': float(pred_proba[1]) if pred_proba is not None else None,
-        'probability_down': float(pred_proba[0]) if pred_proba is not None else None,
-        'confidence': float(max(pred_proba)) if pred_proba is not None else None,
-        'model_used': models[ticker]['best_model_name']
-    }
-
-# Display predictions
-print("\n" + "=" * 80)
-print("PREDICTIONS FOR NEXT 5 DAYS")
-print("=" * 80)
-
-for ticker, pred in forward_predictions.items():
-    print(f"\n{ticker} ({assets[ticker]}):")
-    print(f"  Current Price: ${pred['current_price']:.2f}")
-    print(f"  Prediction: {pred['prediction_direction']}")
-    print(f"  Probability UP: {pred['probability_up']:.1%}")
-    print(f"  Confidence: {pred['confidence']:.1%}")
-    print(f"  Model: {pred['model_used']}")
-
-# Save predictions
-pd.DataFrame(forward_predictions).T.to_csv('forward_predictions_5d.csv')
+    pd.DataFrame(forward_predictions).T.to_csv('forward_predictions_5d.csv')
+    print("\n✓ Saved predictions to forward_predictions_5d.csv")
 
 # ============================================================================
-# SECTION 10: BACKTEST PERFORMANCE ANALYSIS
+# SECTION 11: BACKTEST PERFORMANCE ANALYSIS
 # ============================================================================
 
 print("\n[11/12] Analyzing backtest performance...")
@@ -808,21 +870,18 @@ print("\n[11/12] Analyzing backtest performance...")
 backtest_results = {}
 
 for ticker in assets.keys():
-    if ticker not in models: # Skip if model training failed for this ticker
-        print(f"  ✗ Skipping backtest analysis for {ticker}: No model trained.")
+    if ticker not in predictions:
         continue
+    
     y_test = predictions[ticker]['y_test']
     y_pred = predictions[ticker]['y_pred']
     y_pred_proba = predictions[ticker]['y_pred_proba']
     test_dates = predictions[ticker]['X_test_index']
-
-    # Classification metrics
+    
     accuracy = accuracy_score(y_test, y_pred)
-
-    # Confusion matrix
+    
     cm = confusion_matrix(y_test, y_pred)
-
-    # True positives, false positives, etc.
+    
     if cm.shape == (2, 2):
         tn, fp, fn, tp = cm.ravel()
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
@@ -830,36 +889,31 @@ for ticker in assets.keys():
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     else:
         precision = recall = f1 = 0
-
-    # ROC AUC
+    
     try:
         roc_auc = roc_auc_score(y_test, y_pred_proba) if y_pred_proba is not None else None
     except:
         roc_auc = None
-
-    # Trading simulation
-    test_returns = asset_closes[ticker].loc[test_dates].pct_change().shift(-5)  # 5-day forward
-    test_returns = test_returns.iloc[:-5]  # Remove last 5 days
+    
+    test_returns = asset_closes[ticker].loc[test_dates].pct_change().shift(-5)
+    test_returns = test_returns.iloc[:-5]
     y_pred_aligned = y_pred[:-5] if len(y_pred) > len(test_returns) else y_pred[:len(test_returns)]
-
-    # Strategy returns: go long when predicting up, flat when predicting down
+    
     strategy_returns = test_returns * y_pred_aligned
     strategy_returns = strategy_returns.dropna()
-
-    # Buy and hold returns
+    
     buy_hold_returns = test_returns.dropna()
-
-    # Performance metrics
+    
     if len(strategy_returns) > 0:
         total_strategy_return = (1 + strategy_returns).prod() - 1
         total_buy_hold_return = (1 + buy_hold_returns).prod() - 1
-
+        
         sharpe_strategy = strategy_returns.mean() / strategy_returns.std() * np.sqrt(252) if strategy_returns.std() > 0 else 0
         sharpe_buy_hold = buy_hold_returns.mean() / buy_hold_returns.std() * np.sqrt(252) if buy_hold_returns.std() > 0 else 0
-
+        
         max_dd_strategy = (strategy_returns.cumsum() - strategy_returns.cumsum().cummax()).min()
         max_dd_buy_hold = (buy_hold_returns.cumsum() - buy_hold_returns.cumsum().cummax()).min()
-
+        
         win_rate = (strategy_returns > 0).sum() / len(strategy_returns)
     else:
         total_strategy_return = 0
@@ -869,7 +923,7 @@ for ticker in assets.keys():
         max_dd_strategy = 0
         max_dd_buy_hold = 0
         win_rate = 0
-
+    
     backtest_results[ticker] = {
         'accuracy': accuracy,
         'precision': precision,
@@ -891,18 +945,15 @@ backtest_df.to_csv('backtest_performance.csv')
 
 print("\nBacktest Performance Summary:")
 print("=" * 80)
-if not backtest_df.empty:
-    print(backtest_df[['accuracy', 'sharpe_strategy', 'sharpe_buy_hold', 'outperformance']].to_string())
-else:
-    print("No backtest results available as no models were trained.")
+print(backtest_df[['accuracy', 'sharpe_strategy', 'sharpe_buy_hold', 'outperformance']].to_string())
 
 # ============================================================================
-# SECTION 11: CROSS-ASSET CORRELATION & INTERMARKET ANALYSIS
+# SECTION 12: CORRELATION ANALYSIS & FINAL REPORTS
 # ============================================================================
 
-print("\n[12/12] Performing cross-asset correlation analysis...")
+print("\n[12/12] Performing final analysis...")
 
-# Current correlation matrix
+# Correlation matrix
 recent_returns = returns[list(assets.keys())].tail(60)
 corr_matrix = recent_returns.corr()
 
@@ -910,392 +961,91 @@ print("\nCurrent 60-Day Correlation Matrix:")
 print(corr_matrix.round(3).to_string())
 corr_matrix.to_csv('asset_correlation_matrix.csv')
 
-# Rolling correlations
+# Rolling correlations - NO USO
 rolling_corr = {}
+
+oil_ticker_name = oil_ticker if oil_ticker else 'CL=F'
+
 pairs = [
     ('SPY', 'QQQ', 'Stocks Correlation'),
     ('SPY', 'GLD', 'Stocks vs Gold'),
-    ('SPY', 'USO', 'Stocks vs Oil'),
-    ('USO', 'GLD', 'Oil vs Gold'),
-    ('QQQ', 'GLD', 'Tech vs Gold')
 ]
 
+if oil_ticker_name in returns.columns:
+    pairs.extend([
+        ('SPY', oil_ticker_name, 'Stocks vs Oil'),
+        (oil_ticker_name, 'GLD', 'Oil vs Gold'),
+    ])
+
+pairs.append(('QQQ', 'GLD', 'Tech vs Gold'))
+
 for ticker1, ticker2, label in pairs:
-    rolling_corr[label] = returns[ticker1].rolling(60).corr(returns[ticker2])
+    if ticker1 in returns.columns and ticker2 in returns.columns:
+        rolling_corr[label] = returns[ticker1].rolling(60).corr(returns[ticker2])
 
-rolling_corr_df = pd.DataFrame(rolling_corr)
-rolling_corr_df.to_csv('rolling_correlations.csv')
+if rolling_corr:
+    rolling_corr_df = pd.DataFrame(rolling_corr)
+    rolling_corr_df.to_csv('rolling_correlations.csv')
+    print("\nCurrent Rolling Correlations:")
+    print(rolling_corr_df.tail(1).to_string())
 
-print("\nCurrent Rolling Correlations:")
-print(rolling_corr_df.tail(1).to_string())
-
-# ============================================================================
-# SECTION 12: REGIME-BASED STRATEGY SIGNALS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("REGIME-BASED TRADING SIGNALS")
-print("=" * 80)
-
-# Get current regime
+# Market regime
 current_regime = int(regime_features['regime_current'].iloc[-1])
 regime_names = {0: 'Low Volatility (Bull)', 1: 'Normal', 2: 'High Volatility (Bear)'}
 current_regime_name = regime_names.get(current_regime, 'Unknown')
 
+print("\n" + "=" * 80)
+print("MARKET REGIME & TRADING SIGNALS")
+print("=" * 80)
 print(f"\nCurrent Market Regime: {current_regime_name}")
 
-# Regime-specific recommendations
-regime_strategies = {
-    0: {  # Bull regime
-        'recommended_assets': ['SPY', 'QQQ'],
-        'avoid_assets': [],
-        'strategy': 'Growth-focused, increase equity exposure',
-        'risk_level': 'Moderate-High'
-    },
-    1: {  # Normal regime
-        'recommended_assets': ['SPY', 'QQQ', 'GLD'],
-        'avoid_assets': [],
-        'strategy': 'Balanced allocation across asset classes',
-        'risk_level': 'Moderate'
-    },
-    2: {  # Bear regime
-        'recommended_assets': ['GLD', 'USO'],
-        'avoid_assets': ['QQQ'],
-        'strategy': 'Defensive positioning, favor safe havens',
-        'risk_level': 'Low-Moderate'
-    }
-}
-
-current_strategy = regime_strategies.get(current_regime, regime_strategies[1])
-
-print(f"\nRecommended Strategy: {current_strategy['strategy']}")
-print(f"Risk Level: {current_strategy['risk_level']}")
-print(f"Favor: {', '.join(current_strategy['recommended_assets'])}")
-if current_strategy['avoid_assets']:
-    print(f"Avoid: {', '.join(current_strategy['avoid_assets'])}")
-
-# ============================================================================
-# SECTION 13: COMPREHENSIVE TRADING SIGNALS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("COMPREHENSIVE TRADING SIGNALS")
-print("=" * 80)
-
-trading_signals = {}
-
-for ticker in assets.keys():
-    # Skip if model training failed for this ticker
-    if ticker not in models:
-        print(f"  ✗ Skipping trading signals for {ticker}: No model trained.")
-        continue
-
-    # Get latest technical indicators
-    latest_features = features_dict[ticker].iloc[-1]
-
-    # Prediction signal
-    pred_signal = forward_predictions[ticker]['prediction_direction']
-    confidence = forward_predictions[ticker]['confidence'] # Corrected
-
-    # Technical signals
-    rsi_14 = latest_features.get('rsi_14', 50.0) # Ensure float default
-    if pd.isna(rsi_14): rsi_14 = 50.0
-
-    macd_hist = latest_features.get('macd_hist', 0.0) # Ensure float default
-    if pd.isna(macd_hist): macd_hist = 0.0
-
-    price_to_sma_50 = latest_features.get('price_to_sma_50', 1.0) # Ensure float default
-    if pd.isna(price_to_sma_50): price_to_sma_50 = 1.0
-
-    bb_position_20 = latest_features.get('bb_position_20', 0.5) # Ensure float default
-    if pd.isna(bb_position_20): bb_position_20 = 0.5
-
-    # Determine overall signal strength
-    signals = []
-
-    # ML prediction
-    if pred_signal == 'UP':
-        signals.append(confidence)
-    else:
-        signals.append(-(1 - confidence))
-
-    # RSI signal
-    if rsi_14 < 30:
-        signals.append(0.3)  # Oversold - bullish
-    elif rsi_14 > 70:
-        signals.append(-0.3)  # Overbought - bearish
-    else:
-        signals.append(0)
-
-    # MACD signal
-    if macd_hist > 0:
-        signals.append(0.2)
-    else:
-        signals.append(-0.2)
-
-    # Trend signal (price vs SMA)
-    if price_to_sma_50 > 1.02:
-        signals.append(0.2)
-    elif price_to_sma_50 < 0.98:
-        signals.append(-0.2)
-    else:
-        signals.append(0)
-
-    # Bollinger Band signal
-    if bb_position_20 < 0.2:
-        signals.append(0.2)  # Near lower band - bullish
-    elif bb_position_20 > 0.8:
-        signals.append(-0.2)  # Near upper band - bearish
-    else:
-        signals.append(0)
-
-    # Composite signal
-    composite_signal = np.mean(signals)
-
-    # Determine action
-    if composite_signal > 0.3:
-        action = 'STRONG BUY'
-        color = '🟢'
-    elif composite_signal > 0.1:
-        action = 'BUY'
-        color = '🟢'
-    elif composite_signal < -0.3:
-        action = 'STRONG SELL'
-        color = '🔴'
-    elif composite_signal < -0.1:
-        action = 'SELL'
-        color = '🔴'
-    else:
-        action = 'HOLD'
-        color = '🟡'
-
-    trading_signals[ticker] = {
-        'action': action,
-        'signal_strength': composite_signal,
-        'ml_prediction': pred_signal,
-        'ml_confidence': forward_predictions[ticker]['confidence'],
-        'rsi_14': rsi_14,
-        'macd_hist': macd_hist,
-        'trend': 'Up' if price_to_sma_50 > 1 else 'Down',
-        'current_price': forward_predictions[ticker]['current_price']
-    }
-
-    print(f"\n{color} {ticker} ({assets[ticker]}):")
-    print(f"   Action: {action}")
-    print(f"   Signal Strength: {composite_signal:.2f}")
-    print(f"   ML Prediction: {pred_signal} ({forward_predictions[ticker]['confidence']:.1%} confidence)")
-    print(f"   RSI: {rsi_14:.1f}")
-    print(f"   Trend: {trading_signals[ticker]['trend']}")
-    print(f"   Current Price: ${trading_signals[ticker]['current_price']:.2f}")
-
-# Save trading signals
-pd.DataFrame(trading_signals).T.to_csv('trading_signals_comprehensive.csv')
-
-# ============================================================================
-# SECTION 14: RISK MANAGEMENT RECOMMENDATIONS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("RISK MANAGEMENT RECOMMENDATIONS")
-print("=" * 80)
-
-for ticker in assets.keys():
-    if ticker not in models: # Skip if model training failed for this ticker
-        print(f"  ✗ Skipping risk management for {ticker}: No model trained.")
-        continue
-    current_price = forward_predictions[ticker]['current_price']
-
-    # Get volatility
-    vol = features_dict[ticker]['volatility_20d'].iloc[-1] / 100  # Convert to fraction
-
-    # Calculate position sizing based on volatility
-    account_risk = 0.02  # Risk 2% of account per trade
-
-    # Stop loss at 2x ATR
-    # Ensure atr is a scalar; default to 0.02 * current_price if it's not available or a Series
-    atr_val = features_dict[ticker].get('atr_14', features_dict[ticker].get('atr_7'))
-    if isinstance(atr_val, pd.Series) and not atr_val.empty:
-        atr = atr_val.iloc[-1]
-    elif isinstance(atr_val, (float, np.number)):
-        atr = atr_val
-    else:
-        atr = current_price * 0.02 # Fallback if atr calculation fails or is NaN
+# Trading signals
+for ticker, pred in forward_predictions.items():
+    signal = "🟢 BUY" if pred['prediction_direction'] == 'UP' and pred['confidence'] > 0.65 else \
+             "🔴 SELL" if pred['prediction_direction'] == 'DOWN/FLAT' and pred['confidence'] > 0.65 else \
+             "🟡 HOLD"
     
-    # Handle potential NaN in atr_val.iloc[-1] if the series is all NaNs
-    if pd.isna(atr):
-        atr = current_price * 0.02 # Fallback to a reasonable default
+    print(f"\n{signal} {ticker} ({assets[ticker]})")
+    print(f"  Price: ${pred['current_price']:.2f}")
+    print(f"  Direction: {pred['prediction_direction']} ({pred['confidence']:.1%} confidence)")
+    print(f"  Model: {pred['model_used']}")
 
-    stop_loss_distance = 2 * atr
-    stop_loss_price = current_price - stop_loss_distance
-    stop_loss_pct = (stop_loss_distance / current_price) * 100
-
-    # Take profit at 3x ATR (1.5 risk-reward ratio)
-    take_profit_distance = 3 * atr
-    take_profit_price = current_price + take_profit_distance
-    take_profit_pct = (take_profit_distance / current_price) * 100
-
-    # Position size calculation
-    # Risk per share = stop loss distance
-    # Position size = (Account Value * Risk %) / Risk per share
-    # Assuming $100,000 account
-    account_value = 100000
-    if stop_loss_distance > 0:
-        position_size = (account_value * account_risk) / stop_loss_distance
-    else:
-        position_size = 0 # Avoid division by zero
-    
-    position_value = position_size * current_price
-    position_pct = (position_value / account_value) * 100
-
-    print(f"\n{ticker} ({assets[ticker]}):")
-    print(f"  Current Price: ${current_price:.2f}")
-    print(f"  Stop Loss: ${stop_loss_price:.2f} (-{stop_loss_pct:.1f}%)")
-    print(f"  Take Profit: ${take_profit_price:.2f} (+{take_profit_pct:.1f}%)")
-    print(f"  Suggested Position Size: {position_size:.0f} shares (${position_value:.0f}, {position_pct:.1f}% of account)")
-    print(f"  Daily Volatility: {vol*100:.1f}%")
-
-# ============================================================================
-# SECTION 15: MULTI-HORIZON PREDICTIONS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("MULTI-HORIZON PREDICTIONS")
-print("=" * 80)
-
-multi_horizon_predictions = {}
-
-for ticker in assets.keys():
-    multi_horizon_predictions[ticker] = {}
-
-    for horizon in ['1d', '3d', '5d', '10d', '20d']:
-        try:
-            # Prepare dataset for this horizon
-            X, y = prepare_ml_dataset(ticker, horizon=horizon, target_type='binary')
-
-            # Skip if dataset is empty
-            if X.empty or y.empty:
-                print(f"  ✗ Skipping multi-horizon prediction for {ticker} ({horizon}): Insufficient data.")
-                continue
-
-            # Use last 70% for training
-            train_size = int(len(X) * 0.7)
-            X_train = X.iloc[:train_size]
-            y_train = y.iloc[:train_size]
-            
-            # Ensure train data is not empty
-            if X_train.empty or y_train.empty:
-                print(f"  ✗ Skipping multi-horizon prediction for {ticker} ({horizon}): Insufficient training data.")
-                continue
-
-            # Scale
-            scaler = RobustScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-
-            # Predict latest
-            latest_features_raw = features_dict[ticker].iloc[-1:].copy()
-            
-            # Get the feature names for this horizon's prepared dataset
-            fitted_feature_names_for_horizon = X.columns
-
-            # Reindex latest_features_raw to ensure it has the exact same columns
-            latest_features = latest_features_raw.reindex(columns=fitted_feature_names_for_horizon, fill_value=np.nan)
-
-            # Fill any NaNs that might have been introduced by reindexing or were already there.
-            # Use the medians from the X_clean data (ml_datasets[ticker]['X']) for consistency.
-            training_medians = ml_datasets[ticker]['X'].median()
-            latest_features = latest_features.fillna(training_medians)
-
-            # Ensure no remaining NaNs (e.g., if a new column was all NaN and not covered by median) by filling with 0
-            latest_features = latest_features.fillna(0)
-
-            latest_scaled = scaler.transform(latest_features)
-
-            pred_class = model.predict(latest_scaled)[0]
-            pred_proba = model.predict_proba(latest_scaled)[0]
-
-            multi_horizon_predictions[ticker][horizon] = {
-                'direction': 'UP' if pred_class == 1 else 'DOWN',
-                'probability_up': float(pred_proba[1]),
-                'confidence': float(max(pred_proba))
-            }
-        except Exception as e:
-            print(f"  ✗ Error during multi-horizon prediction for {ticker} ({horizon}): {e}")
-            continue
-
-print("\nPrediction Confidence Across Horizons:")
-for ticker in assets.keys():
-    print(f"\n{ticker}:")
-    for horizon in ['1d', '3d', '5d', '10d', '20d']:
-        if horizon in multi_horizon_predictions.get(ticker, {}):
-            pred = multi_horizon_predictions[ticker][horizon]
-            print(f"  {horizon}: {pred['direction']} ({pred['confidence']:.1%} confidence)")
-
-# Save multi-horizon predictions
-multi_horizon_df = pd.DataFrame({
-    ticker: {
-        f"{horizon}_{key}": multi_horizon_predictions[ticker][horizon][key]
-        for horizon in multi_horizon_predictions.get(ticker, {})
-        for key in multi_horizon_predictions[ticker][horizon]
-    }
-    for ticker in multi_horizon_predictions
-}).T
-
-multi_horizon_df.to_csv('multi_horizon_predictions.csv')
-
-# ============================================================================
-# SECTION 16: EXPORT SUMMARY & METADATA
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("GENERATING FINAL REPORTS")
-print("=" * 80)
-
-# Filter relevant data for summary if models were not trained for all assets
-filtered_forward_predictions = {k: v for k, v in forward_predictions.items() if k in models}
-filtered_trading_signals = {k: v for k, v in trading_signals.items() if k in models}
-filtered_backtest_results = {k: v for k, v in backtest_results.items() if k in models}
-
+# Summary report
 summary = {
     'analysis_timestamp': datetime.utcnow().isoformat(),
     'market_regime': current_regime_name,
-    'regime_code': int(current_regime),
+    'oil_source': oil_source if oil_ticker_used else 'N/A',
+    'oil_price': current_oil_price if oil_ticker_used else None,
     'assets_analyzed': list(assets.keys()),
     'predictions': {
         ticker: {
-            'direction': pred['prediction_direction'],
-            'confidence': pred['confidence'],
-            'current_price': pred['current_price']
+            'direction': forward_predictions[ticker]['prediction_direction'],
+            'confidence': forward_predictions[ticker]['confidence'],
+            'current_price': forward_predictions[ticker]['current_price']
         }
-        for ticker, pred in filtered_forward_predictions.items()
-    } if filtered_forward_predictions else {},
-    'trading_signals': {
-        ticker: signal['action']
-        for ticker, signal in filtered_trading_signals.items()
-    } if filtered_trading_signals else {},
+        for ticker in forward_predictions.keys()
+    },
     'backtest_performance': {
         ticker: {
-            'accuracy': res['accuracy'],
-            'sharpe_strategy': res['sharpe_strategy'],
-            'outperformance': res['outperformance']
+            'accuracy': backtest_results[ticker]['accuracy'],
+            'sharpe_strategy': backtest_results[ticker]['sharpe_strategy'],
+            'outperformance': backtest_results[ticker]['outperformance']
         }
-        for ticker, res in filtered_backtest_results.items()
-    } if filtered_backtest_results else {},
-    'top_pick': max(filtered_forward_predictions.items(), key=lambda x: x[1]['confidence'])[0] if filtered_forward_predictions else 'N/A',
-    'most_bullish': max(filtered_trading_signals.items(), key=lambda x: x[1]['signal_strength'])[0] if filtered_trading_signals else 'N/A',
-    'most_bearish': min(filtered_trading_signals.items(), key=lambda x: x[1]['signal_strength'])[0] if filtered_trading_signals else 'N/A'
+        for ticker in backtest_results.keys()
+    }
 }
 
 with open('analysis_summary.json', 'w') as f:
     json.dump(summary, f, indent=2)
 
-# Metadata
 metadata = {
-    'system': 'Multi-Asset Market Movement Prediction System',
-    'version': '1.0',
+    'system': 'Multi-Asset Market Movement Prediction System V2',
+    'version': '2.0 - CL=F Oil Futures',
     'timestamp_utc': pd.Timestamp.utcnow().isoformat(),
     'python_version': sys.version.split()[0],
     'assets_tracked': list(assets.keys()),
-    'features_per_asset': len(features_dict['SPY'].columns) if 'SPY' in features_dict and not features_dict['SPY'].empty else 0,
+    'oil_ticker_used': oil_ticker_used,
+    'features_per_asset': len(features_dict[list(assets.keys())[0]].columns),
     'models_used': ['Logistic Regression', 'Random Forest', 'Gradient Boosting', 'XGBoost', 'LightGBM', 'Ensemble'],
     'prediction_horizons': list(horizons.keys()),
     'data_period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
@@ -1305,47 +1055,21 @@ metadata = {
 with open('system_metadata.json', 'w') as f:
     json.dump(metadata, f, indent=2)
 
-print("\n✅ Analysis complete! Generated files:")
+print("\n" + "=" * 80)
+print("ANALYSIS COMPLETE!")
+print("=" * 80)
+
+print("\n✅ Generated files:")
 print("   - forward_predictions_5d.csv")
 print("   - backtest_performance.csv")
 print("   - asset_correlation_matrix.csv")
 print("   - rolling_correlations.csv")
-print("   - trading_signals_comprehensive.csv")
-print("   - multi_horizon_predictions.csv")
 print("   - feature_importance_*.csv (per asset)")
 print("   - analysis_summary.json")
 print("   - system_metadata.json")
 
-print("\n" + "=" * 80)
-print("FINAL RECOMMENDATIONS")
-print("=" * 80)
-
-print(f"\n🎯 Market Regime: {current_regime_name}")
-print(f"📊 Strategy: {current_strategy['strategy']}")
-
-if summary['top_pick'] != 'N/A':
-    print(f"\n🏆 Highest Confidence Prediction: {summary['top_pick']}")
-    print(f"   → {forward_predictions[summary['top_pick']]['prediction_direction']} with {forward_predictions[summary['top_pick']]['confidence']:.1%} confidence")
-
-if summary['most_bullish'] != 'N/A':
-    print(f"\n🐂 Most Bullish: {summary['most_bullish']}")
-    print(f"   → Signal Strength: {trading_signals[summary['most_bullish']]['signal_strength']:.2f}")
-
-if summary['most_bearish'] != 'N/A':
-    print(f"\n🐻 Most Bearish: {summary['most_bearish']}")
-    print(f"   → Signal Strength: {trading_signals[summary['most_bearish']]['signal_strength']:.2f}")
-
-if filtered_backtest_results: # Only print if there's any backtest result
-    print("\n📈 Best Backtest Performer:")
-    best_performer = max(filtered_backtest_results.items(), key=lambda x: x[1]['sharpe_strategy'])
-    print(f"   {best_performer[0]}: Sharpe {best_performer[1]['sharpe_strategy']:.2f}, Outperformance {best_performer[1]['outperformance']:.2f}%")
-else:
-    print("\n📈 No backtest performance available to rank.")
-
-print("\n" + "=" * 80)
-print("MULTI-ASSET FORECASTING SYSTEM - COMPLETE")
-print("=" * 80)
-print("\n⚠️  Disclaimer: This is for educational purposes only.")
-print("    Past performance does not guarantee future results.")
+print(f"\n💡 Oil Data: Using {oil_source} at ${current_oil_price:.2f}/barrel")
+print(f"📊 Market Regime: {current_regime_name}")
+print("\n⚠️  Disclaimer: For educational purposes only.")
 print("    Always conduct your own research before trading.")
 print("\nHappy Trading! 🚀📊")
