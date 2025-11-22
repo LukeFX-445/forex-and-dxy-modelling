@@ -1,4 +1,460 @@
-# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
+print(f"\n💡 Oil Data: Using {oil_source} at ${current_oil_price:.2f}/barrel")
+print(f"📊 Market Regime: {current_regime_name}")
+
+# ============================================================================
+# SECTION 13: S&P 500 FUNDAMENTAL ANALYSIS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("SECTION 13: S&P 500 (SPY) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
+print("=" * 80)
+
+spy_factors = {
+    '1. Fed Policy & Interest Rates': {
+        'status': f"Fed Funds: {macro_indicators.get('fed_funds_rate', 0):.2f}% | " + 
+                 ('RESTRICTIVE' if macro_indicators.get('fed_funds_rate', 0) > 5 else 'ACCOMMODATIVE'),
+        'key_metrics': {
+            'Fed Funds Rate': f"{macro_indicators.get('fed_funds_rate', 0):.2f}%",
+            '1M Change': f"{macro_indicators.get('fed_funds_1m_change', 0):.2f}%",
+            '1Y Change': f"{macro_indicators.get('fed_funds_1y_change', 0):.2f}%",
+            'Real 10Y Yield': f"{macro_indicators.get('real_yield_10y', 0):.2f}%"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('fed_funds_rate', 0) > 5 else 'POSITIVE',
+        'reasoning': 'Restrictive policy pressures valuations' if macro_indicators.get('fed_funds_rate', 0) > 5
+                    else 'Accommodative policy supports risk assets'
+    },
+    '2. Treasury Yields & Curve Shape': {
+        'status': f"10Y: {macro_indicators.get('yield_10y', 0):.2f}% | Curve: {macro_indicators.get('yield_curve_2_10', 0):.2f}%",
+        'key_metrics': {
+            '2Y Yield': f"{macro_indicators.get('yield_2y', 0):.2f}%",
+            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
+            '30Y Yield': f"{macro_indicators.get('yield_30y', 0):.2f}%",
+            '2Y-10Y Spread': f"{macro_indicators.get('yield_curve_2_10', 0):.2f}%",
+            '10Y-30Y Spread': f"{macro_indicators.get('yield_curve_10_30', 0):.2f}%",
+            'Inverted': str(macro_indicators.get('yield_curve_inverted', False))
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('yield_curve_inverted', False) else 'NEUTRAL',
+        'reasoning': '⚠️ INVERTED CURVE - Strong recession signal (12-18mo lead time)' if macro_indicators.get('yield_curve_inverted', False)
+                    else 'Normal upward-sloping curve supports growth expectations'
+    },
+    '3. Credit Conditions & Spreads': {
+        'status': 'STRESS' if macro_indicators.get('credit_stress', False) else 'STABLE',
+        'key_metrics': {
+            'HY vs IG Spread Δ': f"{macro_indicators.get('hy_ig_spread_change', 0):.2f}%",
+            'Treasury vs Corp': f"{macro_indicators.get('treasury_corp_spread', 0):.2f}%",
+            'Credit Stress Alert': str(macro_indicators.get('credit_stress', False))
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('credit_stress', False) else 'POSITIVE',
+        'reasoning': '⚠️ Widening credit spreads signal funding stress and default risk' if macro_indicators.get('credit_stress', False)
+                    else 'Tight spreads indicate healthy credit markets and low default risk'
+    },
+    '4. Liquidity & Financial Conditions': {
+        'status': macro_indicators.get('liquidity_proxy', 'NORMAL'),
+        'key_metrics': {
+            'Liquidity Proxy': macro_indicators.get('liquidity_proxy', 'N/A'),
+            'QE/QT Regime': 'QT (Tightening)' if macro_indicators.get('fed_funds_rate', 0) > 4 else 'Neutral'
+        },
+        'impact': 'POSITIVE' if macro_indicators.get('liquidity_proxy') == 'High' else 'NEUTRAL',
+        'reasoning': 'Ample liquidity (M2, Fed balance sheet) supports asset prices' if macro_indicators.get('liquidity_proxy') == 'High'
+                    else 'QT and rate hikes drain liquidity, pressuring valuations'
+    },
+    '5. Market Volatility & Risk Appetite': {
+        'status': f"VIX: {macro_indicators.get('vix_current', 0):.1f} | " +
+                 ('HIGH FEAR' if macro_indicators.get('vix_current', 15) > 25 else
+                  ('ELEVATED' if macro_indicators.get('vix_current', 15) > 20 else 'LOW FEAR')),
+        'key_metrics': {
+            'VIX Current': f"{macro_indicators.get('vix_current', 0):.2f}",
+            'VIX 20D Avg': f"{macro_indicators.get('vix_20d_avg', 0):.2f}",
+            'VIX Spike Active': str(macro_indicators.get('vix_spike', False)),
+            'VVIX (Vol of Vol)': f"{macro_indicators.get('vvix', 0):.2f}"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('vix_current', 15) > 25 else 'POSITIVE',
+        'reasoning': '⚠️ Elevated volatility suppresses risk appetite, increases put buying' if macro_indicators.get('vix_current', 15) > 25
+                    else 'Low VIX supports equity inflows and complacency risks'
+    },
+    '6. Valuation & Earnings Expectations': {
+        'status': f"ERP: {macro_indicators.get('equity_risk_premium', 0):.2f}%",
+        'key_metrics': {
+            'Equity Risk Premium': f"{macro_indicators.get('equity_risk_premium', 0):.2f}%",
+            'ERP Attractive (>2%)': str(macro_indicators.get('erp_attractive', False)),
+            'Est. P/E Ratio': '22x (historical avg)'
+        },
+        'impact': 'POSITIVE' if macro_indicators.get('erp_attractive', False) else 'NEUTRAL',
+        'reasoning': 'Attractive risk premium vs bonds supports equity allocation' if macro_indicators.get('erp_attractive', False)
+                    else 'Limited valuation cushion; earnings growth must accelerate'
+    },
+    '7. Market Breadth & Participation': {
+        'status': 'BROAD' if macro_indicators.get('small_cap_leadership', False) else 'NARROW',
+        'key_metrics': {
+            'Large vs Small Cap': f"{macro_indicators.get('large_vs_small_cap', 0):.2f}%",
+            'Small Cap Leading': str(macro_indicators.get('small_cap_leadership', False)),
+            'Top Sector': macro_indicators.get('top_sector', 'N/A'),
+            'Worst Sector': macro_indicators.get('worst_sector', 'N/A')
+        },
+        'impact': 'POSITIVE' if macro_indicators.get('small_cap_leadership', False) else 'NEUTRAL',
+        'reasoning': 'Broad participation (small caps leading) signals healthy, sustainable rally' if macro_indicators.get('small_cap_leadership', False)
+                    else 'Narrow leadership (mega caps only) creates fragility'
+    },
+    '8. Recession Risk Signals': {
+        'status': macro_indicators.get('recession_risk', 'LOW'),
+        'key_metrics': {
+            'Risk Level': macro_indicators.get('recession_risk', 'N/A'),
+            'Active Signals': ', '.join(macro_indicators.get('recession_signals', ['None']))
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('recession_risk') == 'High' else 'NEUTRAL',
+        'reasoning': f"⚠️ MULTIPLE RECESSION SIGNALS: {', '.join(macro_indicators.get('recession_signals', []))}" 
+                    if macro_indicators.get('recession_risk') == 'High'
+                    else 'Limited near-term recession indicators; expansion continues'
+    },
+    '9. Current Market Regime': {
+        'status': current_regime_name,
+        'key_metrics': {
+            'Regime': current_regime_name,
+            'Regime Confidence': f"{max([p for p in [regime_features['regime_0_prob'].iloc[-1], regime_features['regime_1_prob'].iloc[-1], regime_features['regime_2_prob'].iloc[-1]]]):.1%}"
+        },
+        'impact': 'POSITIVE' if current_regime == 0 else ('NEUTRAL' if current_regime == 1 else 'NEGATIVE'),
+        'reasoning': 'Bull market regime supports continued upside momentum' if current_regime == 0
+                    else ('Normal volatility regime - range-bound' if current_regime == 1 else 'Bear market regime - high downside risk')
+    }
+}
+
+print("\n📊 S&P 500 Fundamental Drivers:")
+for factor, details in spy_factors.items():
+    print(f"\n{factor}")
+    print(f"  Status: {details['status']}")
+    if 'key_metrics' in details:
+        for metric, value in details['key_metrics'].items():
+            print(f"    • {metric}: {value}")
+    print(f"  Impact: {details['impact']}")
+    print(f"  → {details['reasoning']}")
+
+spy_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in spy_factors.values())
+print(f"\n📈 SPY COMPOSITE MACRO SCORE: {spy_macro_score:+d}/{len(spy_factors)} factors")
+print(f"   Rating: {'BULLISH' if spy_macro_score > 2 else ('BEARISH' if spy_macro_score < -2 else 'NEUTRAL')}")
+
+# ============================================================================
+# SECTION 14: NASDAQ-100 FUNDAMENTAL ANALYSIS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("SECTION 14: NASDAQ-100 (QQQ) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
+print("=" * 80)
+
+qqq_factors = {
+    '1. Real Yields & Duration Sensitivity': {
+        'status': 'HEADWIND' if macro_indicators.get('real_yield_10y', 0) > 2 else 'TAILWIND',
+        'key_metrics': {
+            'Nominal 10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
+            'Real 10Y Yield': f"{macro_indicators.get('real_yield_10y', 0):.2f}%",
+            'TIPS Real Yield': f"{macro_indicators.get('tips_real_yield', 0):.2f}%",
+            '10Y Δ (1M)': f"{macro_indicators.get('yield_10y_1m_change', 0):.2f}%",
+            '10Y Δ (3M)': f"{macro_indicators.get('yield_10y_3m_change', 0):.2f}%"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('real_yield_10y', 0) > 2 else 'POSITIVE',
+        'reasoning': '⚠️ High real rates pressure tech valuations (higher discount rates for long-duration cash flows)' 
+                    if macro_indicators.get('real_yield_10y', 0) > 2 
+                    else 'Low/negative real rates support growth stock valuations'
+    },
+    '2. Big Tech Earnings & Guidance': {
+        'status': 'MONITOR',
+        'key_metrics': {
+            'Tech Sector (XLK) vs SPY': f"{macro_indicators.get('tech_vs_market', 0):.2f}%",
+            'Tech Leading': str(macro_indicators.get('tech_leadership', False))
+        },
+        'impact': 'POSITIVE' if macro_indicators.get('tech_leadership', False) else 'NEUTRAL',
+        'reasoning': 'Tech sector outperformance signals strong AI/cloud/digital demand' if macro_indicators.get('tech_leadership', False)
+                    else 'Tech lagging; watch MSFT, AAPL, GOOGL, META, NVDA earnings'
+    },
+    '3. Valuation vs Discount Rate Regime': {
+        'status': 'STRETCHED' if macro_indicators.get('yield_10y', 0) > 4.5 else 'REASONABLE',
+        'key_metrics': {
+            'P/E Premium': 'Tech ~28x vs SPY ~22x',
+            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('yield_10y', 0) > 4.5 else 'NEUTRAL',
+        'reasoning': 'Premium valuations vulnerable to rate shock' if macro_indicators.get('yield_10y', 0) > 4.5
+                    else 'Valuation reasonable given growth premium'
+    },
+    '4. USD Strength (Revenue Translation)': {
+        'status': macro_indicators.get('dxy_strength', 'NEUTRAL'),
+        'key_metrics': {
+            'DXY Current': f"{macro_indicators.get('dxy_current', 0):.2f}",
+            'DXY Δ (1M)': f"{macro_indicators.get('dxy_1m_change', 0):.2f}",
+            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}",
+            'DXY Δ (6M)': f"{macro_indicators.get('dxy_6m_change', 0):.2f}"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'POSITIVE',
+        'reasoning': '⚠️ Strong dollar hurts multinational tech (50%+ international revenue) on translation' 
+                    if macro_indicators.get('dxy_strength') == 'Strong'
+                    else 'Weak dollar tailwind for international revenue'
+    },
+    '5. Semiconductor Cycle & Hardware Demand': {
+        'status': 'MONITOR',
+        'key_metrics': {
+            'Note': 'Track NVDA, AMD, INTC, QCOM, MU earnings'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'AI chip demand strong but cyclical concerns for consumer/PC chips'
+    },
+    '6. AI Investment Cycle & CapEx': {
+        'status': 'STRONG',
+        'key_metrics': {
+            'Note': 'Mega-cap AI capex: $150B+ annually'
+        },
+        'impact': 'POSITIVE',
+        'reasoning': 'Massive AI infrastructure buildout supports NVDA, MSFT, cloud providers'
+    },
+    '7. Credit/Liquidity & Growth Funding': {
+        'status': 'TIGHT' if macro_indicators.get('credit_stress', False) else 'ADEQUATE',
+        'key_metrics': {
+            'Credit Stress': str(macro_indicators.get('credit_stress', False)),
+            'VC Funding': 'Down 50% YoY (2023-24)'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Higher rates pressure unprofitable growth companies and VC funding'
+    },
+    '8. Risk Appetite & Momentum Flows': {
+        'status': 'RISK-ON' if current_regime == 0 else 'RISK-OFF',
+        'key_metrics': {
+            'Regime': current_regime_name,
+            'Bitcoin Equity Corr': f"{macro_indicators.get('bitcoin_equity_correlation', 0):.2f}",
+            'Crypto Risk-On': str(macro_indicators.get('crypto_risk_on', False))
+        },
+        'impact': 'POSITIVE' if current_regime == 0 else 'NEGATIVE',
+        'reasoning': 'Low vol regime fuels growth/momentum rallies (QQQ benefits)' if current_regime == 0
+                    else 'High vol triggers rotation out of high-beta tech'
+    }
+}
+
+print("\n💻 NASDAQ-100 Fundamental Drivers:")
+for factor, details in qqq_factors.items():
+    print(f"\n{factor}")
+    print(f"  Status: {details['status']}")
+    if 'key_metrics' in details:
+        for metric, value in details['key_metrics'].items():
+            print(f"    • {metric}: {value}")
+    print(f"  Impact: {details['impact']}")
+    print(f"  → {details['reasoning']}")
+
+qqq_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in qqq_factors.values())
+print(f"\n📈 QQQ COMPOSITE MACRO SCORE: {qqq_macro_score:+d}/{len(qqq_factors)} factors")
+print(f"   Rating: {'BULLISH' if qqq_macro_score > 2 else ('BEARISH' if qqq_macro_score < -2 else 'NEUTRAL')}")
+
+# ============================================================================
+# SECTION 15: WTI CRUDE OIL FUNDAMENTAL ANALYSIS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("SECTION 15: WTI CRUDE OIL (CL=F) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
+print("=" * 80)
+
+oil_factors = {
+    '1. Global Demand Growth': {
+        'status': 'MODERATE',
+        'key_metrics': {
+            'Oil-Equity Correlation': f"{corr_matrix.loc['SPY', oil_ticker]:.2f}" if oil_ticker in corr_matrix.columns else 'N/A',
+            'US/China/EM': 'Monitor industrial production & transport demand'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Positive correlation with equities suggests demand tied to growth; watch China reopening impact'
+    },
+    '2. OPEC+ Policy & Quota Compliance': {
+        'status': 'CONSTRAINED SUPPLY',
+        'key_metrics': {
+            'Current Price': f"${current_oil_price:.2f}/bbl",
+            'OPEC+ Cuts': '~2M bbl/day (as of late 2024)'
+        },
+        'impact': 'BULLISH',
+        'reasoning': 'OPEC+ production cuts (Saudi/Russia leadership) support prices; monitor compliance and cheating'
+    },
+    '3. US Shale Production & Rig Counts': {
+        'status': 'RISING SLOWLY',
+        'key_metrics': {
+            'US Production': '~13M bbl/day',
+            'Note': 'Track EIA weekly production & Baker Hughes rig count'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'US shale responds to higher prices but capital discipline limits growth; depletion rates 30-50%/year'
+    },
+    '4. Inventory Levels & EIA Reports': {
+        'status': 'MONITOR WEEKLY',
+        'key_metrics': {
+            'Note': 'Watch EIA Wednesday releases & SPR refill plans'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Inventory builds = bearish; draws = bullish. SPR refills could support demand at $70-80'
+    },
+    '5. Geopolitical Supply Risk': {
+        'status': 'ELEVATED',
+        'key_metrics': {
+            'Middle East': 'Israel/Iran/Red Sea shipping risks',
+            'Russia/Ukraine': 'Sanctions on Russian oil',
+            'Risk Premium': '$5-10/bbl estimated'
+        },
+        'impact': 'BULLISH',
+        'reasoning': '⚠️ Middle East tensions, Russia-Ukraine conflict, and Iran risks support $5-10/bbl risk premium'
+    },
+    '6. Refinery Utilization & Crack Spreads': {
+        'status': 'MONITOR',
+        'key_metrics': {
+            'Note': 'Track 3-2-1 crack spreads (refining margins)'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'High refinery utilization and strong crack spreads signal tight product markets'
+    },
+    '7. USD Strength Impact': {
+        'status': macro_indicators.get('dxy_strength', 'NEUTRAL'),
+        'key_metrics': {
+            'DXY': f"{macro_indicators.get('dxy_current', 0):.2f}",
+            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'NEUTRAL',
+        'reasoning': '⚠️ Strong dollar makes oil more expensive for foreign buyers, pressuring global demand' 
+                    if macro_indicators.get('dxy_strength') == 'Strong'
+                    else 'Dollar strength not a major headwind currently'
+    },
+    '8. Global Growth & Recession Risk': {
+        'status': macro_indicators.get('recession_risk', 'LOW'),
+        'key_metrics': {
+            'Recession Risk': macro_indicators.get('recession_risk', 'N/A'),
+            'Oil Volatility (60D)': f"{macro_indicators.get('oil_volatility_60d', 0):.1f}%"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('recession_risk') == 'High' else 'NEUTRAL',
+        'reasoning': 'Recession fears = demand destruction (oil down 20-30% in recession)' if macro_indicators.get('recession_risk') == 'High'
+                    else 'Stable growth supports demand'
+    },
+    '9. Term Structure & Positioning': {
+        'status': 'BACKWARDATION',
+        'key_metrics': {
+            'Structure': 'Backwardation typical = tight supply',
+            'Note': 'Track CFTC COT report for speculative positioning'
+        },
+        'impact': 'BULLISH',
+        'reasoning': 'Backwardation (near > far) signals tight current supply; contango would signal glut'
+    },
+    '10. Alternative Energy & Policy': {
+        'status': 'LONG-TERM HEADWIND',
+        'key_metrics': {
+            'EV Adoption': 'Growing but <15% of sales',
+            'Note': 'Carbon policies, IRA subsidies, Europe emissions targets'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'EV adoption and renewables are long-term demand headwind but negligible near-term (2-5yr)'
+    }
+}
+
+print("\n🛢️  WTI Crude Oil Fundamental Drivers:")
+for factor, details in oil_factors.items():
+    print(f"\n{factor}")
+    print(f"  Status: {details['status']}")
+    if 'key_metrics' in details:
+        for metric, value in details['key_metrics'].items():
+            print(f"    • {metric}: {value}")
+    print(f"  Impact: {details['impact']}")
+    print(f"  → {details['reasoning']}")
+
+oil_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in oil_factors.values())
+print(f"\n📈 OIL COMPOSITE MACRO SCORE: {oil_macro_score:+d}/{len(oil_factors)} factors")
+print(f"   Rating: {'BULLISH' if oil_macro_score > 2 else ('BEARISH' if oil_macro_score < -2 else 'NEUTRAL')}")
+
+# ============================================================================
+# SECTION 16: GOLD FUNDAMENTAL ANALYSIS
+# ============================================================================
+
+print("\n" + "=" * 80)
+print("SECTION 16: GOLD (GLD) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
+print("=" * 80)
+
+gold_factors = {
+    '1. Real Interest Rates (Opportunity Cost)': {
+        'status': 'ELEVATED' if macro_indicators.get('real_yield_10y', 0) > 2 else 'SUPPORTIVE',
+        'key_metrics': {
+            'Nominal 10Y': f"{macro_indicators.get('yield_10y', 0):.2f}%",
+            'Real 10Y (est)': f"{macro_indicators.get('real_yield_10y', 0):.2f}%",
+            'TIPS Yield': f"{macro_indicators.get('tips_real_yield', 0):.2f}%"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('real_yield_10y', 0) > 2 else 'POSITIVE',
+        'reasoning': '⚠️ High real rates (>2%) increase opportunity cost of holding zero-yield gold' 
+                    if macro_indicators.get('real_yield_10y', 0) > 2 
+                    else 'Low/negative real rates (<1%) make gold attractive vs fixed income'
+    },
+    '2. USD Strength (Inverse Relationship)': {
+        'status': 'HEADWIND' if macro_indicators.get('dxy_strength') == 'Strong' else 'TAILWIND',
+        'key_metrics': {
+            'DXY': f"{macro_indicators.get('dxy_current', 0):.2f}",
+            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}",
+            'Gold-SPY Correlation': f"{macro_indicators.get('gold_equity_correlation', 0):.2f}"
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'POSITIVE',
+        'reasoning': '⚠️ Strong dollar pressures gold (USD-denominated, inverse relationship ~-0.7 correlation)' 
+                    if macro_indicators.get('dxy_strength') == 'Strong'
+                    else 'Weak dollar provides tailwind for gold prices'
+    },
+    '3. Inflation Expectations & Central Bank Credibility': {
+        'status': 'MODERATE',
+        'key_metrics': {
+            'Implied Inflation': '~2.5% (10Y breakeven proxy)',
+            'Note': 'Track CPI/PCE releases and Fed commentary'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Inflation moderating but above target; gold demand depends on whether inflation re-accelerates'
+    },
+    '4. Safe Haven Demand (Geopolitics & Crisis)': {
+        'status': 'MODERATE' if current_regime != 2 else 'ELEVATED',
+        'key_metrics': {
+            'VIX': f"{macro_indicators.get('vix_current', 0):.2f}",
+            'Market Regime': current_regime_name,
+            'Gold Safe Haven Active': str(macro_indicators.get('gold_safe_haven_active', False))
+        },
+        'impact': 'POSITIVE' if current_regime == 2 or macro_indicators.get('vix_current', 15) > 25 else 'NEUTRAL',
+        'reasoning': 'Elevated market stress drives safe haven flows into gold' if current_regime == 2
+                    else 'Low stress reduces safe haven demand (gold-equity correlation positive in bull markets)'
+    },
+    '5. Central Bank Buying (Reserves Policy)': {
+        'status': 'STRONG',
+        'key_metrics': {
+            'CB Demand': 'China, India, Russia accumulating',
+            '2023-24': '~1,000 tonnes annually by central banks'
+        },
+        'impact': 'BULLISH',
+        'reasoning': 'Central banks (esp. China, India, Russia) buying record amounts for de-dollarization and reserves diversification'
+    },
+    '6. Liquidity & Monetary Policy': {
+        'status': 'TIGHTENING' if macro_indicators.get('fed_funds_rate', 0) > 4.5 else 'EASING',
+        'key_metrics': {
+            'Fed Funds': f"{macro_indicators.get('fed_funds_rate', 0):.2f}%",
+            'QE/QT': 'QT active' if macro_indicators.get('fed_funds_rate', 0) > 4 else 'Neutral'
+        },
+        'impact': 'NEGATIVE' if macro_indicators.get('fed_funds_rate', 0) > 4.5 else 'POSITIVE',
+        'reasoning': 'QT and rate hikes drain liquidity, pressure gold' if macro_indicators.get('fed_funds_rate', 0) > 4.5
+                    else 'QE and rate cuts expand liquidity, support gold'
+    },
+    '7. Equity Market Stress (Risk-Off Flows)': {
+        'status': 'LOW STRESS' if current_regime == 0 else 'HIGH STRESS',
+        'key_metrics': {
+            'VIX': f"{macro_indicators.get('vix_current', 0):.2f}",
+            'Gold Δ (3M)': f"{macro_indicators.get('gold_return_3m', 0):.2f}%"
+        },
+        'impact': 'NEUTRAL' if current_regime == 0 else 'POSITIVE',
+        'reasoning': 'Low equity volatility reduces gold safe haven flows' if current_regime == 0
+                    else 'Equity selloff triggers defensive rotation into gold'
+    },
+    '8. Physical Demand (Jewelry, India/China)': {
+        'status': 'SEASONAL',
+        'key_metrics': {
+            'India': 'Q4 wedding season, Diwali demand',
+            'China': 'Lunar New Year (Q1)',
+            'Note': 'Track WGC quarterly demand reports'
+        },
+        'impact': 'NEUTRAL',
+        'reasoning': 'Physical demand cyclical; India/China account for ~50% of jewelry demand'
+    },
+    '9. ETF & Futures Positioning': {
+        'status': 'MONITOR',
+        'key_metrics': {
+            'GLD Holdings': 'Track daily for institutional flows',
+            'Gold Miners (GDX) Corr': f"{macro_indicators.get('gold_miners_correlation', 0):.2f}",
+            'Miners Leverage': f"{macro_indicators.get('miners_leverage', 0):.2f}x" if 'miners_# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
 # Predicts: S&P 500, NASDAQ, Oil (CL=F), Gold with ML, regime detection, and macro signals
 # FIXED: All USO references removed, uses CL=F (WTI Crude Oil Futures) directly
 
