@@ -1,1712 +1,843 @@
-print(f"\n💡 Oil Data: Using {oil_source} at ${current_oil_price:.2f}/barrel")
-print(f"📊 Market Regime: {current_regime_name}")
-
-# ============================================================================
-# SECTION 13: S&P 500 FUNDAMENTAL ANALYSIS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("SECTION 13: S&P 500 (SPY) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
-print("=" * 80)
-
-spy_factors = {
-    '1. Fed Policy & Interest Rates': {
-        'status': f"Fed Funds: {macro_indicators.get('fed_funds_rate', 0):.2f}% | " + 
-                 ('RESTRICTIVE' if macro_indicators.get('fed_funds_rate', 0) > 5 else 'ACCOMMODATIVE'),
-        'key_metrics': {
-            'Fed Funds Rate': f"{macro_indicators.get('fed_funds_rate', 0):.2f}%",
-            '1M Change': f"{macro_indicators.get('fed_funds_1m_change', 0):.2f}%",
-            '1Y Change': f"{macro_indicators.get('fed_funds_1y_change', 0):.2f}%",
-            'Real 10Y Yield': f"{macro_indicators.get('real_yield_10y', 0):.2f}%"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('fed_funds_rate', 0) > 5 else 'POSITIVE',
-        'reasoning': 'Restrictive policy pressures valuations' if macro_indicators.get('fed_funds_rate', 0) > 5
-                    else 'Accommodative policy supports risk assets'
-    },
-    '2. Treasury Yields & Curve Shape': {
-        'status': f"10Y: {macro_indicators.get('yield_10y', 0):.2f}% | Curve: {macro_indicators.get('yield_curve_2_10', 0):.2f}%",
-        'key_metrics': {
-            '2Y Yield': f"{macro_indicators.get('yield_2y', 0):.2f}%",
-            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
-            '30Y Yield': f"{macro_indicators.get('yield_30y', 0):.2f}%",
-            '2Y-10Y Spread': f"{macro_indicators.get('yield_curve_2_10', 0):.2f}%",
-            '10Y-30Y Spread': f"{macro_indicators.get('yield_curve_10_30', 0):.2f}%",
-            'Inverted': str(macro_indicators.get('yield_curve_inverted', False))
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('yield_curve_inverted', False) else 'NEUTRAL',
-        'reasoning': '⚠️ INVERTED CURVE - Strong recession signal (12-18mo lead time)' if macro_indicators.get('yield_curve_inverted', False)
-                    else 'Normal upward-sloping curve supports growth expectations'
-    },
-    '3. Credit Conditions & Spreads': {
-        'status': 'STRESS' if macro_indicators.get('credit_stress', False) else 'STABLE',
-        'key_metrics': {
-            'HY vs IG Spread Δ': f"{macro_indicators.get('hy_ig_spread_change', 0):.2f}%",
-            'Treasury vs Corp': f"{macro_indicators.get('treasury_corp_spread', 0):.2f}%",
-            'Credit Stress Alert': str(macro_indicators.get('credit_stress', False))
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('credit_stress', False) else 'POSITIVE',
-        'reasoning': '⚠️ Widening credit spreads signal funding stress and default risk' if macro_indicators.get('credit_stress', False)
-                    else 'Tight spreads indicate healthy credit markets and low default risk'
-    },
-    '4. Liquidity & Financial Conditions': {
-        'status': macro_indicators.get('liquidity_proxy', 'NORMAL'),
-        'key_metrics': {
-            'Liquidity Proxy': macro_indicators.get('liquidity_proxy', 'N/A'),
-            'QE/QT Regime': 'QT (Tightening)' if macro_indicators.get('fed_funds_rate', 0) > 4 else 'Neutral'
-        },
-        'impact': 'POSITIVE' if macro_indicators.get('liquidity_proxy') == 'High' else 'NEUTRAL',
-        'reasoning': 'Ample liquidity (M2, Fed balance sheet) supports asset prices' if macro_indicators.get('liquidity_proxy') == 'High'
-                    else 'QT and rate hikes drain liquidity, pressuring valuations'
-    },
-    '5. Market Volatility & Risk Appetite': {
-        'status': f"VIX: {macro_indicators.get('vix_current', 0):.1f} | " +
-                 ('HIGH FEAR' if macro_indicators.get('vix_current', 15) > 25 else
-                  ('ELEVATED' if macro_indicators.get('vix_current', 15) > 20 else 'LOW FEAR')),
-        'key_metrics': {
-            'VIX Current': f"{macro_indicators.get('vix_current', 0):.2f}",
-            'VIX 20D Avg': f"{macro_indicators.get('vix_20d_avg', 0):.2f}",
-            'VIX Spike Active': str(macro_indicators.get('vix_spike', False)),
-            'VVIX (Vol of Vol)': f"{macro_indicators.get('vvix', 0):.2f}"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('vix_current', 15) > 25 else 'POSITIVE',
-        'reasoning': '⚠️ Elevated volatility suppresses risk appetite, increases put buying' if macro_indicators.get('vix_current', 15) > 25
-                    else 'Low VIX supports equity inflows and complacency risks'
-    },
-    '6. Valuation & Earnings Expectations': {
-        'status': f"ERP: {macro_indicators.get('equity_risk_premium', 0):.2f}%",
-        'key_metrics': {
-            'Equity Risk Premium': f"{macro_indicators.get('equity_risk_premium', 0):.2f}%",
-            'ERP Attractive (>2%)': str(macro_indicators.get('erp_attractive', False)),
-            'Est. P/E Ratio': '22x (historical avg)'
-        },
-        'impact': 'POSITIVE' if macro_indicators.get('erp_attractive', False) else 'NEUTRAL',
-        'reasoning': 'Attractive risk premium vs bonds supports equity allocation' if macro_indicators.get('erp_attractive', False)
-                    else 'Limited valuation cushion; earnings growth must accelerate'
-    },
-    '7. Market Breadth & Participation': {
-        'status': 'BROAD' if macro_indicators.get('small_cap_leadership', False) else 'NARROW',
-        'key_metrics': {
-            'Large vs Small Cap': f"{macro_indicators.get('large_vs_small_cap', 0):.2f}%",
-            'Small Cap Leading': str(macro_indicators.get('small_cap_leadership', False)),
-            'Top Sector': macro_indicators.get('top_sector', 'N/A'),
-            'Worst Sector': macro_indicators.get('worst_sector', 'N/A')
-        },
-        'impact': 'POSITIVE' if macro_indicators.get('small_cap_leadership', False) else 'NEUTRAL',
-        'reasoning': 'Broad participation (small caps leading) signals healthy, sustainable rally' if macro_indicators.get('small_cap_leadership', False)
-                    else 'Narrow leadership (mega caps only) creates fragility'
-    },
-    '8. Recession Risk Signals': {
-        'status': macro_indicators.get('recession_risk', 'LOW'),
-        'key_metrics': {
-            'Risk Level': macro_indicators.get('recession_risk', 'N/A'),
-            'Active Signals': ', '.join(macro_indicators.get('recession_signals', ['None']))
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('recession_risk') == 'High' else 'NEUTRAL',
-        'reasoning': f"⚠️ MULTIPLE RECESSION SIGNALS: {', '.join(macro_indicators.get('recession_signals', []))}" 
-                    if macro_indicators.get('recession_risk') == 'High'
-                    else 'Limited near-term recession indicators; expansion continues'
-    },
-    '9. Current Market Regime': {
-        'status': current_regime_name,
-        'key_metrics': {
-            'Regime': current_regime_name,
-            'Regime Confidence': f"{max([p for p in [regime_features['regime_0_prob'].iloc[-1], regime_features['regime_1_prob'].iloc[-1], regime_features['regime_2_prob'].iloc[-1]]]):.1%}"
-        },
-        'impact': 'POSITIVE' if current_regime == 0 else ('NEUTRAL' if current_regime == 1 else 'NEGATIVE'),
-        'reasoning': 'Bull market regime supports continued upside momentum' if current_regime == 0
-                    else ('Normal volatility regime - range-bound' if current_regime == 1 else 'Bear market regime - high downside risk')
-    }
-}
-
-print("\n📊 S&P 500 Fundamental Drivers:")
-for factor, details in spy_factors.items():
-    print(f"\n{factor}")
-    print(f"  Status: {details['status']}")
-    if 'key_metrics' in details:
-        for metric, value in details['key_metrics'].items():
-            print(f"    • {metric}: {value}")
-    print(f"  Impact: {details['impact']}")
-    print(f"  → {details['reasoning']}")
-
-spy_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in spy_factors.values())
-print(f"\n📈 SPY COMPOSITE MACRO SCORE: {spy_macro_score:+d}/{len(spy_factors)} factors")
-print(f"   Rating: {'BULLISH' if spy_macro_score > 2 else ('BEARISH' if spy_macro_score < -2 else 'NEUTRAL')}")
-
-# ============================================================================
-# SECTION 14: NASDAQ-100 FUNDAMENTAL ANALYSIS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("SECTION 14: NASDAQ-100 (QQQ) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
-print("=" * 80)
-
-qqq_factors = {
-    '1. Real Yields & Duration Sensitivity': {
-        'status': 'HEADWIND' if macro_indicators.get('real_yield_10y', 0) > 2 else 'TAILWIND',
-        'key_metrics': {
-            'Nominal 10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
-            'Real 10Y Yield': f"{macro_indicators.get('real_yield_10y', 0):.2f}%",
-            'TIPS Real Yield': f"{macro_indicators.get('tips_real_yield', 0):.2f}%",
-            '10Y Δ (1M)': f"{macro_indicators.get('yield_10y_1m_change', 0):.2f}%",
-            '10Y Δ (3M)': f"{macro_indicators.get('yield_10y_3m_change', 0):.2f}%"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('real_yield_10y', 0) > 2 else 'POSITIVE',
-        'reasoning': '⚠️ High real rates pressure tech valuations (higher discount rates for long-duration cash flows)' 
-                    if macro_indicators.get('real_yield_10y', 0) > 2 
-                    else 'Low/negative real rates support growth stock valuations'
-    },
-    '2. Big Tech Earnings & Guidance': {
-        'status': 'MONITOR',
-        'key_metrics': {
-            'Tech Sector (XLK) vs SPY': f"{macro_indicators.get('tech_vs_market', 0):.2f}%",
-            'Tech Leading': str(macro_indicators.get('tech_leadership', False))
-        },
-        'impact': 'POSITIVE' if macro_indicators.get('tech_leadership', False) else 'NEUTRAL',
-        'reasoning': 'Tech sector outperformance signals strong AI/cloud/digital demand' if macro_indicators.get('tech_leadership', False)
-                    else 'Tech lagging; watch MSFT, AAPL, GOOGL, META, NVDA earnings'
-    },
-    '3. Valuation vs Discount Rate Regime': {
-        'status': 'STRETCHED' if macro_indicators.get('yield_10y', 0) > 4.5 else 'REASONABLE',
-        'key_metrics': {
-            'P/E Premium': 'Tech ~28x vs SPY ~22x',
-            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('yield_10y', 0) > 4.5 else 'NEUTRAL',
-        'reasoning': 'Premium valuations vulnerable to rate shock' if macro_indicators.get('yield_10y', 0) > 4.5
-                    else 'Valuation reasonable given growth premium'
-    },
-    '4. USD Strength (Revenue Translation)': {
-        'status': macro_indicators.get('dxy_strength', 'NEUTRAL'),
-        'key_metrics': {
-            'DXY Current': f"{macro_indicators.get('dxy_current', 0):.2f}",
-            'DXY Δ (1M)': f"{macro_indicators.get('dxy_1m_change', 0):.2f}",
-            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}",
-            'DXY Δ (6M)': f"{macro_indicators.get('dxy_6m_change', 0):.2f}"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'POSITIVE',
-        'reasoning': '⚠️ Strong dollar hurts multinational tech (50%+ international revenue) on translation' 
-                    if macro_indicators.get('dxy_strength') == 'Strong'
-                    else 'Weak dollar tailwind for international revenue'
-    },
-    '5. Semiconductor Cycle & Hardware Demand': {
-        'status': 'MONITOR',
-        'key_metrics': {
-            'Note': 'Track NVDA, AMD, INTC, QCOM, MU earnings'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'AI chip demand strong but cyclical concerns for consumer/PC chips'
-    },
-    '6. AI Investment Cycle & CapEx': {
-        'status': 'STRONG',
-        'key_metrics': {
-            'Note': 'Mega-cap AI capex: $150B+ annually'
-        },
-        'impact': 'POSITIVE',
-        'reasoning': 'Massive AI infrastructure buildout supports NVDA, MSFT, cloud providers'
-    },
-    '7. Credit/Liquidity & Growth Funding': {
-        'status': 'TIGHT' if macro_indicators.get('credit_stress', False) else 'ADEQUATE',
-        'key_metrics': {
-            'Credit Stress': str(macro_indicators.get('credit_stress', False)),
-            'VC Funding': 'Down 50% YoY (2023-24)'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Higher rates pressure unprofitable growth companies and VC funding'
-    },
-    '8. Risk Appetite & Momentum Flows': {
-        'status': 'RISK-ON' if current_regime == 0 else 'RISK-OFF',
-        'key_metrics': {
-            'Regime': current_regime_name,
-            'Bitcoin Equity Corr': f"{macro_indicators.get('bitcoin_equity_correlation', 0):.2f}",
-            'Crypto Risk-On': str(macro_indicators.get('crypto_risk_on', False))
-        },
-        'impact': 'POSITIVE' if current_regime == 0 else 'NEGATIVE',
-        'reasoning': 'Low vol regime fuels growth/momentum rallies (QQQ benefits)' if current_regime == 0
-                    else 'High vol triggers rotation out of high-beta tech'
-    }
-}
-
-print("\n💻 NASDAQ-100 Fundamental Drivers:")
-for factor, details in qqq_factors.items():
-    print(f"\n{factor}")
-    print(f"  Status: {details['status']}")
-    if 'key_metrics' in details:
-        for metric, value in details['key_metrics'].items():
-            print(f"    • {metric}: {value}")
-    print(f"  Impact: {details['impact']}")
-    print(f"  → {details['reasoning']}")
-
-qqq_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in qqq_factors.values())
-print(f"\n📈 QQQ COMPOSITE MACRO SCORE: {qqq_macro_score:+d}/{len(qqq_factors)} factors")
-print(f"   Rating: {'BULLISH' if qqq_macro_score > 2 else ('BEARISH' if qqq_macro_score < -2 else 'NEUTRAL')}")
-
-# ============================================================================
-# SECTION 15: WTI CRUDE OIL FUNDAMENTAL ANALYSIS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("SECTION 15: WTI CRUDE OIL (CL=F) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
-print("=" * 80)
-
-oil_factors = {
-    '1. Global Demand Growth': {
-        'status': 'MODERATE',
-        'key_metrics': {
-            'Oil-Equity Correlation': f"{corr_matrix.loc['SPY', oil_ticker]:.2f}" if (oil_ticker and 'SPY' in corr_matrix.index and oil_ticker in corr_matrix.columns) else 'N/A',
-            'US/China/EM': 'Monitor industrial production & transport demand'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Positive correlation with equities suggests demand tied to growth; watch China reopening impact'
-    },
-    '2. OPEC+ Policy & Quota Compliance': {
-        'status': 'CONSTRAINED SUPPLY',
-        'key_metrics': {
-            'Current Price': f"${current_oil_price:.2f}/bbl" if current_oil_price else 'N/A',
-            'Note': 'Monitor OPEC+ meeting decisions and compliance rates'
-        },
-        'impact': 'BULLISH',
-        'reasoning': 'Production cuts by major producers support prices; monitor Saudi/Russia compliance'
-    },
-    '3. US Shale Production & Rig Counts': {
-        'status': 'RISING SLOWLY',
-        'key_metrics': {
-            'US Production': '~13M bbl/day',
-            'Note': 'Track EIA weekly production & Baker Hughes rig count'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'US shale responds to higher prices but capital discipline limits growth; depletion rates 30-50%/year'
-    },
-    '4. Inventory Levels & EIA Reports': {
-        'status': 'MONITOR WEEKLY',
-        'key_metrics': {
-            'Note': 'Watch EIA Wednesday releases & SPR refill plans'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Inventory builds = bearish; draws = bullish. SPR refills could support demand at $70-80'
-    },
-    '5. Geopolitical Supply Risk': {
-        'status': 'ELEVATED',
-        'key_metrics': {
-            'Middle East': 'Israel/Iran/Red Sea shipping risks',
-            'Russia/Ukraine': 'Sanctions on Russian oil',
-            'Risk Premium': '$5-10/bbl estimated'
-        },
-        'impact': 'BULLISH',
-        'reasoning': '⚠️ Middle East tensions, Russia-Ukraine conflict, and Iran risks support $5-10/bbl risk premium'
-    },
-    '6. Refinery Utilization & Crack Spreads': {
-        'status': 'MONITOR',
-        'key_metrics': {
-            'Note': 'Track 3-2-1 crack spreads (refining margins)'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'High refinery utilization and strong crack spreads signal tight product markets'
-    },
-    '7. USD Strength Impact': {
-        'status': macro_indicators.get('dxy_strength', 'NEUTRAL'),
-        'key_metrics': {
-            'DXY': f"{macro_indicators.get('dxy_current', 0):.2f}",
-            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'NEUTRAL',
-        'reasoning': '⚠️ Strong dollar makes oil more expensive for foreign buyers, pressuring global demand' 
-                    if macro_indicators.get('dxy_strength') == 'Strong'
-                    else 'Dollar strength not a major headwind currently'
-    },
-    '8. Global Growth & Recession Risk': {
-        'status': macro_indicators.get('recession_risk', 'LOW'),
-        'key_metrics': {
-            'Recession Risk': macro_indicators.get('recession_risk', 'N/A'),
-            'Oil Volatility (60D)': f"{macro_indicators.get('oil_volatility_60d', 0):.1f}%"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('recession_risk') == 'High' else 'NEUTRAL',
-        'reasoning': 'Recession fears = demand destruction (oil down 20-30% in recession)' if macro_indicators.get('recession_risk') == 'High'
-                    else 'Stable growth supports demand'
-    },
-    '9. Term Structure & Positioning': {
-        'status': 'BACKWARDATION',
-        'key_metrics': {
-            'Structure': 'Backwardation typical = tight supply',
-            'Note': 'Track CFTC COT report for speculative positioning'
-        },
-        'impact': 'BULLISH',
-        'reasoning': 'Backwardation (near > far) signals tight current supply; contango would signal glut'
-    },
-    '10. Alternative Energy & Policy': {
-        'status': 'LONG-TERM HEADWIND',
-        'key_metrics': {
-            'EV Adoption': 'Growing but <15% of sales',
-            'Note': 'Carbon policies, IRA subsidies, Europe emissions targets'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'EV adoption and renewables are long-term demand headwind but negligible near-term (2-5yr)'
-    }
-}
-
-print("\n🛢️  WTI Crude Oil Fundamental Drivers:")
-for factor, details in oil_factors.items():
-    print(f"\n{factor}")
-    print(f"  Status: {details['status']}")
-    if 'key_metrics' in details:
-        for metric, value in details['key_metrics'].items():
-            print(f"    • {metric}: {value}")
-    print(f"  Impact: {details['impact']}")
-    print(f"  → {details['reasoning']}")
-
-oil_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in oil_factors.values())
-print(f"\n📈 OIL COMPOSITE MACRO SCORE: {oil_macro_score:+d}/{len(oil_factors)} factors")
-print(f"   Rating: {'BULLISH' if oil_macro_score > 2 else ('BEARISH' if oil_macro_score < -2 else 'NEUTRAL')}")
-
-# ============================================================================
-# SECTION 16: GOLD FUNDAMENTAL ANALYSIS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("SECTION 16: GOLD (GLD) - COMPREHENSIVE FUNDAMENTAL ANALYSIS")
-print("=" * 80)
-
-gold_factors = {
-    '1. Real Interest Rates (Opportunity Cost)': {
-        'status': 'ELEVATED' if macro_indicators.get('real_yield_10y', 0) > 2 else 'SUPPORTIVE',
-        'key_metrics': {
-            'Nominal 10Y': f"{macro_indicators.get('yield_10y', 0):.2f}%",
-            'Real 10Y (est)': f"{macro_indicators.get('real_yield_10y', 0):.2f}%",
-            'TIPS Yield': f"{macro_indicators.get('tips_real_yield', 0):.2f}%"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('real_yield_10y', 0) > 2 else 'POSITIVE',
-        'reasoning': '⚠️ High real rates (>2%) increase opportunity cost of holding zero-yield gold' 
-                    if macro_indicators.get('real_yield_10y', 0) > 2 
-                    else 'Low/negative real rates (<1%) make gold attractive vs fixed income'
-    },
-    '2. USD Strength (Inverse Relationship)': {
-        'status': 'HEADWIND' if macro_indicators.get('dxy_strength') == 'Strong' else 'TAILWIND',
-        'key_metrics': {
-            'DXY': f"{macro_indicators.get('dxy_current', 0):.2f}",
-            'DXY Δ (3M)': f"{macro_indicators.get('dxy_3m_change', 0):.2f}",
-            'Gold-SPY Correlation': f"{macro_indicators.get('gold_equity_correlation', 0):.2f}"
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('dxy_strength') == 'Strong' else 'POSITIVE',
-        'reasoning': '⚠️ Strong dollar pressures gold (USD-denominated, inverse relationship ~-0.7 correlation)' 
-                    if macro_indicators.get('dxy_strength') == 'Strong'
-                    else 'Weak dollar provides tailwind for gold prices'
-    },
-    '3. Inflation Expectations & Central Bank Credibility': {
-        'status': 'MODERATE',
-        'key_metrics': {
-            'Implied Inflation': '~2.5% (10Y breakeven proxy)',
-            'Note': 'Track CPI/PCE releases and Fed commentary'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Inflation moderating but above target; gold demand depends on whether inflation re-accelerates'
-    },
-    '4. Safe Haven Demand (Geopolitics & Crisis)': {
-        'status': 'MODERATE' if current_regime != 2 else 'ELEVATED',
-        'key_metrics': {
-            'VIX': f"{macro_indicators.get('vix_current', 0):.2f}",
-            'Market Regime': current_regime_name,
-            'Gold Safe Haven Active': str(macro_indicators.get('gold_safe_haven_active', False))
-        },
-        'impact': 'POSITIVE' if current_regime == 2 or macro_indicators.get('vix_current', 15) > 25 else 'NEUTRAL',
-        'reasoning': 'Elevated market stress drives safe haven flows into gold' if current_regime == 2
-                    else 'Low stress reduces safe haven demand (gold-equity correlation positive in bull markets)'
-    },
-    '5. Central Bank Buying (Reserves Policy)': {
-        'status': 'STRONG',
-        'key_metrics': {
-            'CB Demand': 'China, India, Russia accumulating',
-            '2023-24': '~1,000 tonnes annually by central banks'
-        },
-        'impact': 'BULLISH',
-        'reasoning': 'Central banks (esp. China, India, Russia) buying record amounts for de-dollarization and reserves diversification'
-    },
-    '6. Liquidity & Monetary Policy': {
-        'status': 'TIGHTENING' if macro_indicators.get('fed_funds_rate', 0) > 4.5 else 'EASING',
-        'key_metrics': {
-            'Fed Funds': f"{macro_indicators.get('fed_funds_rate', 0):.2f}%",
-            'QE/QT': 'QT active' if macro_indicators.get('fed_funds_rate', 0) > 4 else 'Neutral'
-        },
-        'impact': 'NEGATIVE' if macro_indicators.get('fed_funds_rate', 0) > 4.5 else 'POSITIVE',
-        'reasoning': 'QT and rate hikes drain liquidity, pressure gold' if macro_indicators.get('fed_funds_rate', 0) > 4.5
-                    else 'QE and rate cuts expand liquidity, support gold'
-    },
-    '7. Equity Market Stress (Risk-Off Flows)': {
-        'status': 'LOW STRESS' if current_regime == 0 else 'HIGH STRESS',
-        'key_metrics': {
-            'VIX': f"{macro_indicators.get('vix_current', 0):.2f}",
-            'Gold Δ (3M)': f"{macro_indicators.get('gold_return_3m', 0):.2f}%"
-        },
-        'impact': 'NEUTRAL' if current_regime == 0 else 'POSITIVE',
-        'reasoning': 'Low equity volatility reduces gold safe haven flows' if current_regime == 0
-                    else 'Equity selloff triggers defensive rotation into gold'
-    },
-    '8. Physical Demand (Jewelry, India/China)': {
-        'status': 'SEASONAL',
-        'key_metrics': {
-            'India': 'Q4 wedding season, Diwali demand',
-            'China': 'Lunar New Year (Q1)',
-            'Note': 'Track WGC quarterly demand reports'
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Physical demand cyclical; India/China account for ~50% of jewelry demand'
-    },
-    '9. ETF & Futures Positioning': {
-        'status': 'MONITOR',
-        'key_metrics': {
-            'GLD Holdings': 'Track daily for institutional flows',
-            'Gold Miners (GDX) Corr': f"{macro_indicators.get('gold_miners_correlation', 0):.2f}",
-            'Miners Leverage': f"{macro_indicators.get('miners_leverage', 1.0):.2f}x"
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'GDX typically 2-3x leveraged to gold moves; track CFTC COT report for speculative positioning'
-    },
-    '10. Opportunity Cost vs Other Assets': {
-        'status': 'COMPETING WITH BONDS & CRYPTO',
-        'key_metrics': {
-            '10Y Yield': f"{macro_indicators.get('yield_10y', 0):.2f}%",
-            'Bitcoin 1M Return': f"{macro_indicators.get('bitcoin_return_1m', 0):.2f}%",
-            'Gold 1M Return': f"{macro_indicators.get('gold_return_1m', 0):.2f}%"
-        },
-        'impact': 'NEUTRAL',
-        'reasoning': 'Gold competes with bonds (yield), crypto (speculative store of value), and cash'
-    }
-}
-
-print("\n🥇 Gold Fundamental Drivers:")
-for factor, details in gold_factors.items():
-    print(f"\n{factor}")
-    print(f"  Status: {details['status']}")
-    if 'key_metrics' in details:
-        for metric, value in details['key_metrics'].items():
-            print(f"    • {metric}: {value}")
-    print(f"  Impact: {details['impact']}")
-    print(f"  → {details['reasoning']}")
-
-gold_macro_score = sum(1 if d['impact'] in ['POSITIVE', 'BULLISH'] else (-1 if d['impact'] in ['NEGATIVE', 'BEARISH'] else 0) for d in gold_factors.values())
-print(f"\n📈 GOLD COMPOSITE MACRO SCORE: {gold_macro_score:+d}/{len(gold_factors)} factors")
-print(f"   Rating: {'BULLISH' if gold_macro_score > 2 else ('BEARISH' if gold_macro_score < -2 else 'NEUTRAL')}")
-
-# ============================================================================
-# COMPOSITE ANALYSIS & COMBINED SIGNALS
-# ============================================================================
-
-print("\n" + "=" * 80)
-print("COMPOSITE MACRO SCORES & COMBINED TRADING SIGNALS")
-print("=" * 80)
-
-macro_scores = {
-    'SPY': {
-        'score': spy_macro_score,
-        'total_factors': len(spy_factors),
-        'rating': 'BULLISH' if spy_macro_score > 2 else ('BEARISH' if spy_macro_score < -2 else 'NEUTRAL')
-    },
-    'QQQ': {
-        'score': qqq_macro_score,
-        'total_factors': len(qqq_factors),
-        'rating': 'BULLISH' if qqq_macro_score > 2 else ('BEARISH' if qqq_macro_score < -2 else 'NEUTRAL')
-    },
-    'CL=F': {
-        'score': oil_macro_score,
-        'total_factors': len(oil_factors),
-        'rating': 'BULLISH' if oil_macro_score > 2 else ('BEARISH' if oil_macro_score < -2 else 'NEUTRAL')
-    },
-    'GLD': {
-        'score': gold_macro_score,
-        'total_factors': len(gold_factors),
-        'rating': 'BULLISH' if gold_macro_score > 1 else ('BEARISH' if gold_macro_score < -1 else 'NEUTRAL')
-    }
-}
-
-print("\n📊 COMPREHENSIVE SIGNAL SUMMARY:")
-print("=" * 80)
-print("\nAsset | Macro Score | Macro Rating | ML Prediction | ML Conf | Combined Signal")
-print("-" * 95)
-
-for ticker in ['SPY', 'QQQ', 'CL=F', 'GLD']:
-    if ticker in forward_predictions and ticker in macro_scores:
-        ml_pred = forward_predictions[ticker]['prediction_direction']
-        ml_conf = forward_predictions[ticker]['confidence']
-        macro = macro_scores[ticker]
-        
-        # Combined signal: both macro and ML must agree for strong signal
-        if macro['rating'] == 'BULLISH' and ml_pred == 'UP' and ml_conf > 0.7:
-            combined = '🟢 STRONG BUY'
-        elif macro['rating'] == 'BEARISH' and ml_pred == 'DOWN/FLAT' and ml_conf > 0.7:
-            combined = '🔴 STRONG SELL'
-        elif macro['rating'] == 'BULLISH' or (ml_pred == 'UP' and ml_conf > 0.65):
-            combined = '🟢 MODERATE BUY'
-        elif macro['rating'] == 'BEARISH' or (ml_pred == 'DOWN/FLAT' and ml_conf > 0.65):
-            combined = '🔴 MODERATE SELL'
-        else:
-            combined = '🟡 HOLD / NEUTRAL'
-        
-        print(f"{ticker:5} | {macro['score']:+3d}/{macro['total_factors']:2d}      | {macro['rating']:12} | {ml_pred:13} | {ml_conf:6.1%} | {combined}")
-
-# Save comprehensive macro analysis
-macro_analysis_output = {
-    'timestamp': datetime.utcnow().isoformat(),
-    'market_regime': current_regime_name,
-    'oil_source': oil_source if oil_ticker_used else 'N/A',
-    'oil_price': float(current_oil_price) if current_oil_price else None,
-    'macro_indicators': {k: (float(v) if isinstance(v, (int, float, np.number)) else str(v)) 
-                        for k, v in macro_indicators.items()},
-    'spy_factors_summary': {
-        'score': spy_macro_score,
-        'total': len(spy_factors),
-        'rating': macro_scores['SPY']['rating']
-    },
-    'qqq_factors_summary': {
-        'score': qqq_macro_score,
-        'total': len(qqq_factors),
-        'rating': macro_scores['QQQ']['rating']
-    },
-    'oil_factors_summary': {
-        'score': oil_macro_score,
-        'total': len(oil_factors),
-        'rating': macro_scores['CL=F']['rating']
-    },
-    'gold_factors_summary': {
-        'score': gold_macro_score,
-        'total': len(gold_factors),
-        'rating': macro_scores['GLD']['rating']
-    },
-    'combined_signals': {
-        ticker: {
-            'macro_rating': macro_scores[ticker]['rating'],
-            'ml_prediction': forward_predictions[ticker]['prediction_direction'] if ticker in forward_predictions else 'N/A',
-            'ml_confidence': float(forward_predictions[ticker]['confidence']) if ticker in forward_predictions else None
-        }
-        for ticker in ['SPY', 'QQQ', 'CL=F', 'GLD']
-    }
-}
-
-with open('comprehensive_macro_analysis.json', 'w') as f:
-    json.dump(macro_analysis_output, f, indent=2)
-
-print("\n✅ Saved comprehensive fundamental analysis to comprehensive_macro_analysis.json")
-
-print("\n" + "=" * 80)
-print("KEY INSIGHTS & ACTION ITEMS")
-print("=" * 80)
-
-# Identify strongest opportunities
-best_opportunity = max(macro_scores.items(), key=lambda x: x[1]['score'])
-worst_opportunity = min(macro_scores.items(), key=lambda x: x[1]['score'])
-
-print(f"\n🏆 STRONGEST OPPORTUNITY: {best_opportunity[0]}")
-print(f"   Macro Score: {best_opportunity[1]['score']}/{best_opportunity[1]['total_factors']} ({best_opportunity[1]['rating']})")
-if best_opportunity[0] in forward_predictions:
-    print(f"   ML Prediction: {forward_predictions[best_opportunity[0]]['prediction_direction']} ({forward_predictions[best_opportunity[0]]['confidence']:.1%})")
-
-print(f"\n⚠️  WEAKEST OPPORTUNITY: {worst_opportunity[0]}")
-print(f"   Macro Score: {worst_opportunity[1]['score']}/{worst_opportunity[1]['total_factors']} ({worst_opportunity[1]['rating']})")
-if worst_opportunity[0] in forward_predictions:
-    print(f"   ML Prediction: {forward_predictions[worst_opportunity[0]]['prediction_direction']} ({forward_predictions[worst_opportunity[0]]['confidence']:.1%})")
-
-# Recession warning
-if macro_indicators.get('recession_risk') == 'High':
-    print(f"\n🚨 RECESSION WARNING:")
-    print(f"   Risk Level: {macro_indicators.get('recession_risk')}")
-    print(f"   Active Signals: {', '.join(macro_indicators.get('recession_signals', []))}")
-    print(f"   → Consider defensive positioning: reduce equity exposure, increase gold/bonds")
-
-# Rate environment
-if macro_indicators.get('fed_funds_rate', 0) > 5:
-    print(f"\n⚠️  HIGH RATE ENVIRONMENT:")
-    print(f"   Fed Funds: {macro_indicators.get('fed_funds_rate', 0):.2f}%")
-    print(f"   → Restrictive policy pressures valuations; favor quality over growth")
-
-print("\n" + "=" * 80)
-print("ANALYSIS COMPLETE - 16 SECTIONS")
-print("=" * 80)
-
-print("\n📁 Generated Files:")
-print("   - forward_predictions_5d.csv")
-print("   - backtest_performance.csv")
-print("   - asset_correlation_matrix.csv")
-print("   - rolling_correlations.csv")
-print("   - feature_importance_*.csv (per asset)")
-print("   - analysis_summary.json")
-print("   - comprehensive_macro_analysis.json")
-print("   - system_metadata.json")
-
-print("\n⚠️  Disclaimer: This analysis is for educational purposes only.")
-print("    Combine quantitative signals with fundamental analysis and your own research.")
-print("    Markets are dynamic - reassess regularly.")
-
-print("\nHappy Trading! 🚀📊")# --- Enhanced Multi-Asset Market Movement Detection & Forecasting System V2 ---
-# Predicts: S&P 500, NASDAQ, Oil (CL=F), Gold with ML, regime detection, and macro signals
-# FIXED: All USO references removed, uses CL=F (WTI Crude Oil Futures) directly
+# ============================================================
+# Multi-Asset Macro-Quant Forecasting System V3 (Oil-First)
+# COLAB-NATIVE SAFE VERSION (NO CORE DOWNGRADES)
+# - Keeps Colab NumPy2 / Pandas2.2+ / SciPy / Sklearn
+# - arch OPTIONAL (fallback vol used if arch incompatible)
+# - lightgbm OPTIONAL (skip if build/import fails)
+# - FIX: macro string features encoded to numeric
+# - FIX: CSV saving uses stdlib ONLY (avoids pandas internals)
+# ============================================================
 
 import warnings
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings("ignore")
 
-print("Installing required packages...")
-!pip install yfinance arch pandas numpy scipy scikit-learn statsmodels xgboost lightgbm --quiet
+# ----------------------------
+# 0) COLAB-NATIVE INSTALL CELL
+# ----------------------------
+!pip install -q --upgrade pip
+!pip install -q yfinance statsmodels xgboost vaderSentiment feedparser
 
+# Optional: lightgbm (may fail to build on some Colab images)
+LGB_AVAILABLE, _lgb_err = False, None
+try:
+    !pip install -q lightgbm
+    import lightgbm as lgb
+    LGB_AVAILABLE = True
+except Exception as e:
+    _lgb_err = e
+    LGB_AVAILABLE = False
+
+# Optional: arch (often incompatible with NumPy2 -> fallback vol will be used)
+ARCH_AVAILABLE, _arch_err = False, None
+try:
+    !pip install -q arch
+    from arch import arch_model
+    ARCH_AVAILABLE = True
+except Exception as e:
+    _arch_err = e
+    ARCH_AVAILABLE = False
+
+print("✅ Colab core stack (left untouched).")
+import numpy as np, pandas as pd, scipy, sklearn
+print("numpy:", np.__version__, "| pandas:", pd.__version__, "| scipy:", scipy.__version__, "| sklearn:", sklearn.__version__)
+print("arch available:", ARCH_AVAILABLE, "| lightgbm available:", LGB_AVAILABLE)
+if _arch_err: print("arch import/install error:", _arch_err)
+if _lgb_err: print("lgb import/install error:", _lgb_err)
+
+# ----------------------------
+# 1) IMPORTS
+# ----------------------------
 import yfinance as yf
-import pandas as pd
-import numpy as np
 from datetime import datetime, timedelta
-import json
-import sys
 from scipy import stats
-from sklearn.preprocessing import StandardScaler, RobustScaler
+
+from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score
+
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
-from statsmodels.tsa.stattools import adfuller, acf
 import xgboost as xgb
-import lightgbm as lgb
-from arch import arch_model
-import math
 
-# ============================================================================
-# SECTION 1: DATA COLLECTION - ASSETS & MACRO INDICATORS
-# ============================================================================
+# ----------------------------
+# 2) CONFIG
+# ----------------------------
+SEED = 42
+np.random.seed(SEED)
 
-print("=" * 80)
-print("MULTI-ASSET MARKET MOVEMENT PREDICTION SYSTEM V2")
-print("=" * 80)
+END_DATE = datetime.utcnow()
+START_DATE = END_DATE - timedelta(days=6 * 365)
 
-print("\n[1/12] Collecting market data...")
-
-end_date = datetime.utcnow()
-start_date = end_date - timedelta(days=5*365)  # 5 years of data
-
-# Define primary assets to predict - NO USO ANYWHERE
-assets = {
-    'SPY': 'S&P 500 ETF',
-    'QQQ': 'NASDAQ-100 ETF',
-    'CL=F': 'WTI Crude Oil Futures',
-    'GLD': 'Gold ETF'
+ASSETS = {
+    "SPY": "S&P 500 ETF",
+    "QQQ": "NASDAQ-100 ETF",
+    "CL=F": "WTI Crude Oil Futures",
+    "GLD": "Gold ETF"
 }
 
-# Backup tickers if primary fails - NO USO
-asset_backups = {
-    'CL=F': ['BZ=F'],  # Only Brent futures as backup
+ASSET_BACKUPS = {"CL=F": ["BZ=F"]}
+
+INDICATORS = {
+    "^VIX": "VIX",
+    "^TNX": "10Y Treasury Yield",
+    "DX-Y.NYB": "DXY",
+    "HYG": "High Yield Credit",
+    "LQD": "Inv Grade Credit",
+    "XLE": "Energy Sector",
+    "UNG": "Nat Gas ETF",
+    "NG=F": "Nat Gas Futures",
+    "XOP": "E&P ETF",
+    "OIH": "Oil Services ETF",
+    "EEM": "EM Equities",
+    "IWM": "US Small Caps",
+    "BZ=F": "Brent Futures"
 }
 
-# Download primary asset data
-print("  Fetching primary assets...")
-asset_data = {}
-failed_assets = []
+HORIZONS = {"1d":1, "3d":3, "5d":5, "10d":10, "20d":20}
+DIR_BINS   = [-np.inf, -0.5, 0.5, np.inf]
+DIR_LABELS = [-1, 0, 1]
 
-for ticker, name in assets.items():
-    try:
-        print(f"    Downloading {ticker}...", end='')
-        data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
-        
-        # Handle both single ticker and multi-ticker returns
-        if isinstance(data.columns, pd.MultiIndex):
-            data = data.xs(ticker, axis=1, level=1)
-        
-        if not data.empty and len(data) > 100:
-            asset_data[ticker] = data
-            print(f" ✓ {name} ({len(data)} days)")
-        else:
-            print(f" ✗ Insufficient data")
-            failed_assets.append(ticker)
-    except Exception as e:
-        print(f" ✗ Failed: {e}")
-        failed_assets.append(ticker)
+# ----------------------------
+# 3) UTILITIES
+# ----------------------------
+def download_single(ticker):
+    data = yf.download(ticker, start=START_DATE, end=END_DATE,
+                       progress=False, auto_adjust=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.xs(ticker, axis=1, level=1)
+    return data
 
-# Try backup tickers for failed assets
-if failed_assets:
-    print("\n  Trying backup tickers...")
-    for failed_ticker in failed_assets:
-        if failed_ticker in asset_backups:
-            for backup_ticker in asset_backups[failed_ticker]:
-                try:
-                    print(f"    Downloading {backup_ticker} (backup for {failed_ticker})...", end='')
-                    data = yf.download(backup_ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
-                    
-                    if isinstance(data.columns, pd.MultiIndex):
-                        data = data.xs(backup_ticker, axis=1, level=1)
-                    
-                    if not data.empty and len(data) > 100:
-                        asset_data[failed_ticker] = data
-                        assets[failed_ticker] = f"{assets[failed_ticker]} ({backup_ticker})"
-                        print(f" ✓ Using {backup_ticker} as backup ({len(data)} days)")
-                        break
-                    else:
-                        print(f" ✗ Insufficient data")
-                except Exception as e:
-                    print(f" ✗ Failed: {e}")
+def safe_pct_change(x, n=1):
+    return x.pct_change(n).replace([np.inf, -np.inf], np.nan)
 
-# Download market indicators - NO USO
-print("\n  Fetching market indicators...")
-indicators = {
-    '^VIX': 'VIX (Volatility Index)',
-    '^TNX': '10-Year Treasury Yield',
-    'DX-Y.NYB': 'US Dollar Index',
-    'TLT': 'Long-Term Treasury ETF',
-    'HYG': 'High Yield Corporate Bond ETF',
-    'LQD': 'Investment Grade Corporate Bond ETF',
-    'EEM': 'Emerging Markets ETF',
-    'IWM': 'Russell 2000 Small Cap ETF',
-    'XLE': 'Energy Sector ETF',
-    'XLF': 'Financial Sector ETF',
-    'XLK': 'Technology Sector ETF',
-    'GDX': 'Gold Miners ETF',
-    'UNG': 'Natural Gas ETF',
-    'BTC-USD': 'Bitcoin',
-    'ETH-USD': 'Ethereum',
-    'BZ=F': 'Brent Oil Futures',
-    'NG=F': 'Natural Gas Futures',
-    'XOP': 'Oil & Gas Exploration ETF',
-    'OIH': 'Oil Services ETF'
-}
+def zscore(series, window):
+    mu = series.rolling(window).mean()
+    sig = series.rolling(window).std()
+    return (series - mu) / sig.replace(0, np.nan)
 
-indicator_data = {}
-for ticker, name in indicators.items():
-    try:
-        data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
-        
-        if isinstance(data.columns, pd.MultiIndex):
-            data = data.xs(ticker, axis=1, level=1)
-        
-        if not data.empty and len(data) > 100:
-            indicator_data[ticker] = data
-            print(f"    ✓ {name}")
-    except Exception as e:
-        continue
-
-print(f"\n✓ Collected data for {len(asset_data)} primary assets and {len(indicator_data)} indicators")
-
-# Display which oil ticker is being used - SAFE VERSION
-oil_ticker_used = None
-oil_source = None
-current_oil_price = None
-
-for ticker in asset_data.keys():
-    if ticker in ['CL=F', 'BZ=F']:
-        oil_ticker_used = ticker
-        break
-
-if oil_ticker_used:
-    current_oil_price = float(asset_data[oil_ticker_used]['Close'].iloc[-1])
-    oil_source = "WTI Crude Oil Futures (CL=F)" if oil_ticker_used == 'CL=F' else "Brent Oil Futures (BZ=F)"
-    print(f"\n💡 Oil Data Source: {oil_source}")
-    print(f"💰 Current Oil Price: ${current_oil_price:.2f}")
-else:
-    print("\n⚠️  Oil Data: Not available")
-
-print(f"\n✓ All data collection complete")
-
-# ============================================================================
-# SECTION 2: DATA PREPROCESSING & FEATURE ENGINEERING
-# ============================================================================
-
-print("\n[2/12] Preprocessing and engineering features...")
+def winsorize_series(s, p=0.01):
+    lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lo, hi)
 
 def extract_ohlcv(data_dict):
-    """Extract OHLCV data from yfinance results"""
-    if not data_dict:
-        empty_df = pd.DataFrame()
-        return empty_df, empty_df, empty_df, empty_df, empty_df
-    
-    closes_dict = {}
-    opens_dict = {}
-    highs_dict = {}
-    lows_dict = {}
-    volumes_dict = {}
-    
-    for ticker, data in data_dict.items():
+    closes, opens, highs, lows, volumes = {}, {}, {}, {}, {}
+    for tkr, d in data_dict.items():
+        if "Close" in d: closes[tkr] = d["Close"]
+        if "Open"  in d: opens[tkr]  = d["Open"]
+        if "High"  in d: highs[tkr]  = d["High"]
+        if "Low"   in d: lows[tkr]   = d["Low"]
+        if "Volume" in d: volumes[tkr] = d["Volume"]
+    return (pd.DataFrame(closes),
+            pd.DataFrame(opens),
+            pd.DataFrame(highs),
+            pd.DataFrame(lows),
+            pd.DataFrame(volumes))
+
+# ----------------------------
+# 4) DATA COLLECTION
+# ----------------------------
+def collect_market_data():
+    asset_data, failed = {}, []
+
+    for tkr in ASSETS:
         try:
-            if 'Close' in data.columns:
-                closes_dict[ticker] = data['Close']
-            if 'Open' in data.columns:
-                opens_dict[ticker] = data['Open']
-            if 'High' in data.columns:
-                highs_dict[ticker] = data['High']
-            if 'Low' in data.columns:
-                lows_dict[ticker] = data['Low']
-            if 'Volume' in data.columns:
-                volumes_dict[ticker] = data['Volume']
+            d = download_single(tkr)
+            if not d.empty and len(d) > 150:
+                asset_data[tkr] = d
+            else:
+                failed.append(tkr)
+        except Exception:
+            failed.append(tkr)
+
+    for ftkr in failed:
+        if ftkr in ASSET_BACKUPS:
+            for btkr in ASSET_BACKUPS[ftkr]:
+                try:
+                    d = download_single(btkr)
+                    if not d.empty and len(d) > 150:
+                        asset_data[ftkr] = d
+                        break
+                except Exception:
+                    continue
+
+    indicator_data = {}
+    for tkr in INDICATORS:
+        try:
+            d = download_single(tkr)
+            if not d.empty and len(d) > 150:
+                indicator_data[tkr] = d
+        except Exception:
+            continue
+
+    return asset_data, indicator_data
+
+# ----------------------------
+# 5) MACRO PROXIES
+# ----------------------------
+def build_macro_indicators(asset_closes, indicator_closes):
+    macro = {}
+
+    if "^TNX" in indicator_closes:
+        tnx = indicator_closes["^TNX"]
+        macro["yield_10y"] = float(tnx.iloc[-1])
+        macro["yield_10y_1m_change"] = float(tnx.diff(21).iloc[-1])
+        macro["yield_10y_3m_change"] = float(tnx.diff(63).iloc[-1])
+
+    if "DX-Y.NYB" in indicator_closes:
+        dxy = indicator_closes["DX-Y.NYB"]
+        macro["dxy_current"] = float(dxy.iloc[-1])
+        macro["dxy_1m_change"] = float(dxy.diff(21).iloc[-1])
+        macro["dxy_3m_change"] = float(dxy.diff(63).iloc[-1])
+        macro["dxy_strength"] = "Strong" if dxy.iloc[-1] > dxy.rolling(200).mean().iloc[-1] else "Weak"
+
+    if "^VIX" in indicator_closes:
+        vix = indicator_closes["^VIX"]
+        macro["vix_current"]  = float(vix.iloc[-1])
+        macro["vix_20d_avg"]  = float(vix.rolling(20).mean().iloc[-1])
+        macro["vix_spike"]    = bool(vix.iloc[-1] > vix.rolling(20).mean().iloc[-1] + vix.rolling(20).std().iloc[-1])
+
+    if "HYG" in indicator_closes and "LQD" in indicator_closes:
+        hyg = indicator_closes["HYG"]
+        lqd = indicator_closes["LQD"]
+        spread_proxy = hyg.pct_change(21).iloc[-1] - lqd.pct_change(21).iloc[-1]
+        macro["credit_spread_proxy"] = float(spread_proxy)
+        macro["credit_stress"]       = bool(spread_proxy < -0.03)
+
+    macro["liquidity_proxy"] = "High" if (macro.get("credit_stress") is False and
+                                          macro.get("vix_current", 20) < 20) else "Normal"
+    macro["equity_risk_premium"] = 2.5
+
+    inv_curve = macro.get("yield_10y",0) < 3.0 and macro.get("credit_stress",False)
+    if inv_curve or macro.get("vix_current",15) > 30:
+        macro["recession_risk"]    = "High"
+        macro["recession_signals"] = ["Credit stress", "Vol spike"]
+    else:
+        macro["recession_risk"]    = "Low"
+        macro["recession_signals"] = ["None"]
+
+    if "CL=F" in asset_closes:
+        oil_ret = asset_closes["CL=F"].pct_change().dropna()
+        macro["oil_volatility_60d"] = float(oil_ret.rolling(60).std().iloc[-1] * np.sqrt(252) * 100)
+
+    return macro
+
+
+# ----------------------------
+# 6) TARGETS
+# ----------------------------
+def make_targets(asset_closes):
+    targets = {}
+    for tkr in ASSETS:
+        price = asset_closes[tkr]
+        tdf = {}
+        for hname, d in HORIZONS.items():
+            fwd = price.pct_change(d).shift(-d) * 100
+            tdf[f"{hname}_direction"] = pd.cut(fwd, DIR_BINS, labels=DIR_LABELS).astype(float)
+            tdf[f"{hname}_binary"]    = (fwd > 0).astype(int)
+            tdf[f"{hname}_return"]    = fwd / 100.0
+        targets[tkr] = pd.DataFrame(tdf, index=price.index)
+    return targets
+
+# ----------------------------
+# 7) VOL (arch optional)
+# ----------------------------
+def _fit_best_arch(r):
+    r = r.dropna() * 100.0
+    candidates = []
+    specs = [
+        ("GARCH","normal", dict(vol="GARCH",p=1,q=1,o=0,dist="normal")),
+        ("GARCH","t",      dict(vol="GARCH",p=1,q=1,o=0,dist="t")),
+        ("EGARCH","normal",dict(vol="EGARCH",p=1,q=1,o=0,dist="normal")),
+        ("EGARCH","t",      dict(vol="EGARCH",p=1,q=1,o=0,dist="t")),
+        ("GJR","normal",   dict(vol="GARCH",p=1,q=1,o=1,dist="normal")),
+        ("GJR","t",        dict(vol="GARCH",p=1,q=1,o=1,dist="t")),
+    ]
+    for name, dist, kw in specs:
+        try:
+            am = arch_model(r, mean="Zero", **kw)
+            res = am.fit(disp="off")
+            candidates.append((res.aic,name,dist,res))
+        except:
+            continue
+    if not candidates:
+        raise RuntimeError("No ARCH models fit.")
+    best = sorted(candidates, key=lambda x: x[0])[0]
+    aic,name,dist,res = best
+    return {"vol":res.conditional_volatility/100.0,
+            "best_name":name,"best_dist":dist,"aic":aic,"res":res}
+
+def _fallback_garch11(r, alpha=0.08, beta=0.90):
+    r = r.dropna()
+    if len(r) < 30:
+        return {"vol": r.rolling(20).std(), "best_name":"ROLLING","best_dist":None,"aic":np.nan,"res":None}
+    var0 = float(r.var())
+    omega = var0*(1-alpha-beta)
+    h = np.zeros(len(r))
+    h[0] = var0
+    for i in range(1,len(r)):
+        h[i] = omega + alpha*(r.iloc[i-1]**2) + beta*h[i-1]
+    vol = pd.Series(np.sqrt(h), index=r.index)
+    return {"vol":vol,"best_name":"GARCH_FALLBACK","best_dist":None,"aic":np.nan,
+            "res":{"alpha":alpha,"beta":beta,"omega":omega}}
+
+def fit_best_vol_model(r):
+    if ARCH_AVAILABLE:
+        try:
+            out = _fit_best_arch(r)
+            out["engine"] = "arch"
+            return out
         except Exception as e:
-            continue
-    
-    closes = pd.DataFrame(closes_dict) if closes_dict else pd.DataFrame()
-    opens = pd.DataFrame(opens_dict) if opens_dict else pd.DataFrame()
-    highs = pd.DataFrame(highs_dict) if highs_dict else pd.DataFrame()
-    lows = pd.DataFrame(lows_dict) if lows_dict else pd.DataFrame()
-    volumes = pd.DataFrame(volumes_dict) if volumes_dict else pd.DataFrame()
-    
-    return closes, opens, highs, lows, volumes
+            print("arch failed, fallback:", e)
+    out = _fallback_garch11(r)
+    out["engine"] = "fallback"
+    return out
 
-print("  Extracting OHLCV data...")
-asset_closes, asset_opens, asset_highs, asset_lows, asset_volumes = extract_ohlcv(asset_data)
-indicator_closes, _, _, _, _ = extract_ohlcv(indicator_data)
 
-if asset_closes.empty:
-    raise ValueError("Failed to extract any price data")
+# ----------------------------
+# 8) REGIMES
+# ----------------------------
+def fit_markov_regime(r, k=3):
+    rvals = (r.dropna()*100).values
+    idx = r.dropna().index
+    try:
+        model = MarkovRegression(rvals, k_regimes=k, switching_variance=True)
+        res = model.fit(disp=False)
+        probs = res.smoothed_marginal_probabilities
+        out = pd.DataFrame({f"regime_{i}_prob":probs[i] for i in range(k)}, index=idx)
+        out["regime_current"] = out.idxmax(axis=1).str.extract("(\d+)").astype(int)
+        return out
+    except:
+        vz = zscore(r.rolling(20).std(),60)
+        rc = pd.cut(vz,[-np.inf,-0.5,0.5,np.inf],labels=[0,1,2]).astype(float)
+        return pd.DataFrame({"regime_current":rc}, index=r.index)
 
-print(f"  ✓ Extracted data for {len(asset_closes.columns)} assets")
 
-# Align all data
-all_closes = pd.concat([asset_closes, indicator_closes], axis=1)
-all_closes = all_closes.ffill(limit=5).dropna(how='all')
+# ----------------------------
+# 9) FEATURE ENGINEERING + MACRO ENCODING
+# ----------------------------
+def encode_macro_value(v):
+    if v is None: return 0.0
+    if isinstance(v,(bool,np.bool_)): return float(int(v))
+    if isinstance(v,(int,float,np.number)): return float(v)
+    if isinstance(v,(list,tuple,dict,set)): return 0.0
+    if isinstance(v,str):
+        s=v.lower()
+        mapping={
+            "strong":1.0,"weak":-1.0,
+            "high":1.0,"normal":0.0,"low":-1.0,
+            "positive":1.0,"negative":-1.0,
+            "bullish":1.0,"bearish":-1.0,"neutral":0.0
+        }
+        if s in mapping: return mapping[s]
+        try:
+            if s.endswith("%"): return float(s[:-1])/100.0
+            return float(s)
+        except: return 0.0
+    return 0.0
 
-# Calculate returns
-returns = all_closes.pct_change().dropna()
-log_returns = np.log(all_closes / all_closes.shift(1)).dropna()
+def engineer_features(tkr, asset_closes, asset_highs, asset_lows, asset_volumes,
+                      indicator_closes, returns, macro_dict, arch_vol, regime_df):
 
-print(f"✓ Data spans {len(all_closes)} trading days")
+    price = asset_closes[tkr]
+    high  = asset_highs[tkr]
+    low   = asset_lows[tkr]
+    volu  = asset_volumes[tkr]
 
-# ============================================================================
-# SECTION 3: TARGET VARIABLE CREATION
-# ============================================================================
+    f = pd.DataFrame(index=price.index)
 
-print("\n[3/12] Creating prediction targets...")
+    # returns + momentum
+    for p in [1,2,3,5,10,20,60]:
+        f[f"ret_{p}d"] = safe_pct_change(price,p)
+        f[f"mom_{p}d"] = price/price.shift(p)-1
 
-horizons = {
-    '1d': 1,
-    '3d': 3,
-    '5d': 5,
-    '10d': 10,
-    '20d': 20
-}
+    # SMAs
+    for w in [5,10,20,50,100,200]:
+        sma=price.rolling(w).mean()
+        f[f"sma_{w}"]=sma
+        f[f"px_sma_{w}"]=price/sma
+        f[f"sma_{w}_slope5"]=sma.diff(5)
 
-targets = {}
-
-for ticker in assets.keys():
-    targets[ticker] = {}
-    
-    for horizon_name, days in horizons.items():
-        forward_return = asset_closes[ticker].pct_change(days).shift(-days)
-        
-        targets[ticker][f'{horizon_name}_direction'] = pd.cut(
-            forward_return * 100,
-            bins=[-np.inf, -0.5, 0.5, np.inf],
-            labels=[-1, 0, 1]
-        ).astype(float)
-        
-        targets[ticker][f'{horizon_name}_binary'] = (forward_return > 0).astype(int)
-        targets[ticker][f'{horizon_name}_return'] = forward_return
-
-for ticker in assets.keys():
-    targets[ticker] = pd.DataFrame(targets[ticker])
-
-print(f"✓ Created targets for {len(horizons)} prediction horizons")
-
-# ============================================================================
-# SECTION 4: COMPREHENSIVE FEATURE ENGINEERING
-# ============================================================================
-
-print("\n[4/12] Engineering comprehensive features...")
-
-features_dict = {}
-
-for ticker in assets.keys():
-    features = pd.DataFrame(index=asset_closes.index)
-    price = asset_closes[ticker]
-    
-    # Returns
-    for period in [1, 2, 3, 5, 10, 20, 60]:
-        features[f'return_{period}d'] = price.pct_change(period)
-        features[f'log_return_{period}d'] = np.log(price / price.shift(period))
-    
-    # Moving averages
-    for window in [5, 10, 20, 50, 100, 200]:
-        features[f'sma_{window}'] = price.rolling(window).mean()
-        features[f'price_to_sma_{window}'] = price / features[f'sma_{window}']
-        features[f'sma_{window}_slope'] = features[f'sma_{window}'].diff(5)
-    
-    # EMA
-    for span in [12, 26, 50]:
-        features[f'ema_{span}'] = price.ewm(span=span).mean()
-        features[f'price_to_ema_{span}'] = price / features[f'ema_{span}']
-    
-    # Moving average crossovers
-    features['sma_cross_50_200'] = features['sma_50'] - features['sma_200']
-    features['ema_cross_12_26'] = features['ema_12'] - features['ema_26']
-    
     # RSI
-    for period in [7, 14, 21, 28]:
-        delta = price.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi_values = 100 - (100 / (1 + rs))
-        rsi_values = rsi_values.fillna(50)
-        features[f'rsi_{period}'] = rsi_values
-    
-    # MACD
-    ema_12 = price.ewm(span=12).mean()
-    ema_26 = price.ewm(span=26).mean()
-    features['macd'] = ema_12 - ema_26
-    features['macd_signal'] = features['macd'].ewm(span=9).mean()
-    features['macd_hist'] = features['macd'] - features['macd_signal']
-    
-    # Stochastic
-    for period in [14, 21]:
-        low_min = asset_lows[ticker].rolling(window=period).min()
-        high_max = asset_highs[ticker].rolling(window=period).max()
-        features[f'stoch_{period}'] = 100 * (price - low_min) / (high_max - low_min)
-        features[f'stoch_{period}_ma'] = features[f'stoch_{period}'].rolling(3).mean()
-    
-    # ROC
-    for period in [5, 10, 20]:
-        features[f'roc_{period}'] = ((price - price.shift(period)) / price.shift(period)) * 100
-    
-    # Volatility
-    for window in [5, 10, 20, 60]:
-        features[f'volatility_{window}d'] = returns[ticker].rolling(window).std() * np.sqrt(252)
-    
-    # Bollinger Bands
-    for window in [20, 50]:
-        sma = price.rolling(window).mean()
-        std = price.rolling(window).std()
-        features[f'bb_upper_{window}'] = sma + 2 * std
-        features[f'bb_lower_{window}'] = sma - 2 * std
-        features[f'bb_width_{window}'] = (features[f'bb_upper_{window}'] - features[f'bb_lower_{window}']) / sma
-        features[f'bb_position_{window}'] = (price - features[f'bb_lower_{window}']) / (features[f'bb_upper_{window}'] - features[f'bb_lower_{window}'])
-    
+    for w in [7,14,21]:
+        d = price.diff()
+        gain=d.clip(lower=0).rolling(w).mean()
+        loss=(-d.clip(upper=0)).rolling(w).mean()
+        rs=gain/loss.replace(0,np.nan)
+        f[f"rsi_{w}"]=(100-100/(1+rs)).fillna(50)
+
     # ATR
-    high = asset_highs[ticker]
-    low = asset_lows[ticker]
-    close_prev = price.shift(1)
-    
-    tr1 = high - low
-    tr2 = abs(high - close_prev)
-    tr3 = abs(low - close_prev)
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    for period in [7, 14, 21]:
-        atr_val = tr.rolling(period).mean()
-        features[f'atr_{period}'] = atr_val
-        features[f'atr_{period}_pct'] = (atr_val / price.replace(0, np.nan)).fillna(0.02) * 100
-    
-    # Volume indicators
-    volume = asset_volumes[ticker]
-    
-    for window in [5, 10, 20]:
-        features[f'volume_sma_{window}'] = volume.rolling(window).mean()
-        features[f'volume_ratio_{window}'] = volume / features[f'volume_sma_{window}']
-    
-    # OBV
-    obv = (np.sign(price.diff()) * volume).fillna(0).cumsum()
-    features['obv'] = obv
-    features['obv_ema'] = obv.ewm(span=20).mean()
-    
-    # VPT
-    features['vpt'] = (volume * ((price - price.shift(1)) / price.shift(1))).cumsum()
-    
-    # Pattern recognition
-    features['higher_high'] = (high > high.shift(1)).astype(int)
-    features['higher_low'] = (low > low.shift(1)).astype(int)
-    features['uptrend_strength'] = features['higher_high'].rolling(5).sum() + features['higher_low'].rolling(5).sum()
-    
-    # Price channels
-    features['channel_high_20'] = high.rolling(20).max()
-    features['channel_low_20'] = low.rolling(20).min()
-    features['channel_position'] = (price - features['channel_low_20']) / (features['channel_high_20'] - features['channel_low_20'])
-    
-    # Distance from 52-week high/low
-    features['dist_from_52w_high'] = (price / high.rolling(252).max() - 1) * 100
-    features['dist_from_52w_low'] = (price / low.rolling(252).min() - 1) * 100
-    
-    # Statistical features
-    for window in [20, 60]:
-        features[f'return_skew_{window}'] = returns[ticker].rolling(window).skew()
-        features[f'return_kurt_{window}'] = returns[ticker].rolling(window).kurt()
-    
-    # Z-score
-    for window in [20, 60]:
-        mean = price.rolling(window).mean()
-        std = price.rolling(window).std()
-        features[f'zscore_{window}'] = (price - mean) / std
-    
-    features_dict[ticker] = features
+    tr=pd.concat([high-low,(high-price.shift(1)).abs(),(low-price.shift(1)).abs()],axis=1).max(axis=1)
+    f["atr_14"]=tr.rolling(14).mean()
+    f["atr_pct"]=f["atr_14"]/price
 
-print(f"✓ Created {len(features_dict[list(assets.keys())[0]].columns)} features per asset")
+    # Bollinger
+    sma20=price.rolling(20).mean()
+    std20=price.rolling(20).std()
+    bb_u=sma20+2*std20
+    bb_l=sma20-2*std20
+    f["bb_pos"]=(price-bb_l)/(bb_u-bb_l)
 
-# ============================================================================
-# SECTION 5: CROSS-ASSET & MACRO FEATURES (NO USO)
-# ============================================================================
+    # volume
+    f["vol_sma20"]=volu.rolling(20).mean()
+    f["vol_ratio"]=volu/f["vol_sma20"]
+    f["obv"]=(np.sign(price.diff())*volu).fillna(0).cumsum()
 
-print("\n[5/12] Creating cross-asset and macro features...")
+    # volatility + regimes
+    f["arch_vol"] = arch_vol.reindex(f.index)
+    f = pd.concat([f, regime_df.reindex(f.index)], axis=1)
 
-market_features = pd.DataFrame(index=all_closes.index)
+    # macro encoded numeric
+    for k,v in macro_dict.items():
+        f[f"macro_{k}"] = encode_macro_value(v)
 
-# VIX features
-if '^VIX' in indicator_closes.columns:
-    vix = indicator_closes['^VIX']
-    market_features['vix'] = vix
-    market_features['vix_sma_20'] = vix.rolling(20).mean()
-    market_features['vix_change'] = vix.pct_change()
-    market_features['vix_spike'] = (vix > vix.rolling(20).mean() + vix.rolling(20).std()).astype(int)
+    # extra indicators
+    if "^VIX" in indicator_closes:
+        vix=indicator_closes["^VIX"].reindex(f.index)
+        f["vix"]=vix
+        f["vix_chg"]=safe_pct_change(vix,1)
 
-# Treasury yield
-if '^TNX' in indicator_closes.columns:
-    tnx = indicator_closes['^TNX']
-    market_features['yield_10y'] = tnx
-    market_features['yield_10y_change'] = tnx.diff()
-    market_features['yield_10y_roc'] = tnx.pct_change(20)
+    if "DX-Y.NYB" in indicator_closes:
+        dxy=indicator_closes["DX-Y.NYB"].reindex(f.index)
+        f["dxy"]=dxy
+        f["dxy_mom20"]=safe_pct_change(dxy,20)
 
-# Dollar Index
-if 'DX-Y.NYB' in indicator_closes.columns:
-    dxy = indicator_closes['DX-Y.NYB']
-    market_features['dxy'] = dxy
-    market_features['dxy_return_20d'] = dxy.pct_change(20)
-    market_features['dxy_sma_50'] = dxy.rolling(50).mean()
+    # oil-specific
+    if tkr=="CL=F":
+        if "BZ=F" in indicator_closes:
+            brent=indicator_closes["BZ=F"].reindex(f.index)
+            f["brent_wti_spread"]=(brent-price)/price
+        if "XLE" in indicator_closes:
+            xle=indicator_closes["XLE"].reindex(f.index)
+            f["xle_mom20"]=safe_pct_change(xle,20)
+        if "NG=F" in indicator_closes:
+            ng=indicator_closes["NG=F"].reindex(f.index)
+            f["ng_mom20"]=safe_pct_change(ng,20)
+        f["roll_basis_60"]=price/price.rolling(60).mean()-1
 
-# Credit spreads
-if 'HYG' in indicator_closes.columns and 'LQD' in indicator_closes.columns:
-    hyg_ret = indicator_closes['HYG'].pct_change(20)
-    lqd_ret = indicator_closes['LQD'].pct_change(20)
-    market_features['credit_spread_proxy'] = hyg_ret - lqd_ret
+    # clean
+    f = f.replace([np.inf,-np.inf],np.nan)
+    for c in f.columns:
+        f[c] = f[c].fillna(f[c].median()) if not f[c].isna().all() else 0.0
+    return f
 
-# Market breadth
-if 'IWM' in indicator_closes.columns:
-    spy_ret = asset_closes['SPY'].pct_change(20)
-    iwm_ret = indicator_closes['IWM'].pct_change(20)
-    market_features['large_vs_small_cap'] = spy_ret - iwm_ret
 
-# Sector rotations
-sector_etfs = ['XLE', 'XLF', 'XLK']
-for sector in sector_etfs:
-    if sector in indicator_closes.columns:
-        sector_ret = indicator_closes[sector].pct_change(20)
-        market_features[f'{sector}_momentum'] = sector_ret
+# ----------------------------
+# 10) PCA FACTORS
+# ----------------------------
+def make_pca_factors(ret_df, n_components=3):
+    r=ret_df.dropna().apply(winsorize_series,axis=0)
+    std=(r-r.mean())/r.std()
+    pca=PCA(n_components=n_components,random_state=SEED)
+    comps=pca.fit_transform(std.values)
+    return pd.DataFrame(comps,index=std.index,columns=[f"pc{i+1}" for i in range(n_components)]),pca
 
-# Crypto correlation
-if 'BTC-USD' in indicator_closes.columns:
-    btc_ret = indicator_closes['BTC-USD'].pct_change(20)
-    market_features['btc_momentum'] = btc_ret
 
-# Inter-asset correlations - NO USO REFERENCES
-oil_ticker = None
-for potential_oil in ['CL=F', 'BZ=F']:
-    if potential_oil in returns.columns:
-        oil_ticker = potential_oil
-        break
+# ----------------------------
+# 11) ML TRAINING (LGB optional)
+# ----------------------------
+def time_series_train_best(X,y):
+    scaler=RobustScaler()
+    Xs=pd.DataFrame(scaler.fit_transform(X),index=X.index,columns=X.columns)
 
-# Calculate correlations based on available tickers
-if 'SPY' in returns.columns and 'QQQ' in returns.columns:
-    market_features['spy_qqq_corr'] = returns['SPY'].rolling(60).corr(returns['QQQ'])
+    candidates={
+        "LR":LogisticRegression(max_iter=2000,class_weight="balanced",random_state=SEED),
+        "RF":RandomForestClassifier(
+            n_estimators=400,max_depth=18,min_samples_split=10,min_samples_leaf=5,
+            max_features="sqrt",class_weight="balanced",n_jobs=-1,random_state=SEED),
+        "GB":GradientBoostingClassifier(
+            n_estimators=300,max_depth=5,learning_rate=0.04,subsample=0.8,random_state=SEED),
+        "XGB":xgb.XGBClassifier(
+            n_estimators=250,max_depth=6,learning_rate=0.05,
+            subsample=0.8,colsample_bytree=0.8,eval_metric="logloss",random_state=SEED)
+    }
+    if LGB_AVAILABLE:
+        candidates["LGB"]=lgb.LGBMClassifier(
+            n_estimators=250,max_depth=6,learning_rate=0.05,
+            subsample=0.8,colsample_bytree=0.8,random_state=SEED,verbose=-1)
 
-if 'SPY' in returns.columns and 'GLD' in returns.columns:
-    market_features['spy_gld_corr'] = returns['SPY'].rolling(60).corr(returns['GLD'])
+    models,scores={},{}
+    tscv=TimeSeriesSplit(n_splits=5)
 
-if oil_ticker and 'SPY' in returns.columns:
-    market_features['spy_oil_corr'] = returns['SPY'].rolling(60).corr(returns[oil_ticker])
+    for name,m in candidates.items():
+        fold_acc=[]; ok=True
+        for tr,te in tscv.split(Xs):
+            try:
+                m.fit(Xs.iloc[tr],y.iloc[tr])
+                pred=m.predict(Xs.iloc[te])
+                fold_acc.append(accuracy_score(y.iloc[te],pred))
+            except:
+                ok=False; break
+        if ok and fold_acc:
+            models[name]=m
+            scores[name]=np.mean(fold_acc)
 
-if oil_ticker and 'GLD' in returns.columns:
-    market_features['oil_gld_corr'] = returns[oil_ticker].rolling(60).corr(returns['GLD'])
+    if not models: return None
 
-if 'QQQ' in returns.columns and 'GLD' in returns.columns:
-    market_features['qqq_gld_corr'] = returns['QQQ'].rolling(60).corr(returns['GLD'])
+    if len(models)>=3:
+        ens=VotingClassifier([(n,models[n]) for n in models],voting="soft")
+        ens.fit(Xs,y)
+        models["ENS"]=ens
+        scores["ENS"]=max(scores.values())+1e-6
 
-if oil_ticker and 'QQQ' in returns.columns:
-    market_features['qqq_oil_corr'] = returns['QQQ'].rolling(60).corr(returns[oil_ticker])
+    best=max(scores,key=scores.get)
+    return {"scaler":scaler,"best_model":models[best],
+            "best_name":best,"cv_score":scores[best]}
 
-# Add market features to each asset
-for ticker in assets.keys():
-    features_dict[ticker] = pd.concat([features_dict[ticker], market_features], axis=1)
 
-print(f"✓ Added {len(market_features.columns)} market-wide features")
+# ----------------------------
+# 12) RISK METRICS
+# ----------------------------
+def risk_metrics(r):
+    r=r.dropna()
+    if len(r)<30: return {}
+    mu,sig=r.mean(),r.std()
+    var_95=np.quantile(r,0.05)
+    cvar_95=r[r<=var_95].mean()
+    sharpe=(mu/sig)*np.sqrt(252) if sig>0 else 0
+    downside=r[r<0].std()
+    sortino=(mu/downside)*np.sqrt(252) if downside>0 else 0
+    gains=r.clip(lower=0).sum()
+    losses=(-r).clip(lower=0).sum()
+    omega=gains/losses if losses>0 else np.inf
+    return {"mean":mu,"vol":sig*np.sqrt(252),"VaR_95":var_95,"CVaR_95":cvar_95,
+            "sharpe":sharpe,"sortino":sortino,"omega":omega,
+            "skew":r.skew(),"kurtosis":r.kurt()}
 
-print(f"\n✅ All USO references removed - using CL=F (WTI Crude Oil Futures) at ${current_oil_price:.2f}")
 
-# ============================================================================
-# SECTION 6: REGIME DETECTION
-# ============================================================================
+# ----------------------------
+# 13) MONTE CARLO
+# ----------------------------
+def monte_carlo_forecast(px_series,vol_series,horizon_days=5,n_sims=5000,
+                         jump_prob=0.02,jump_mu=-0.01,jump_sigma=0.04,df_t=5):
 
-print("\n[6/12] Detecting market regimes...")
+    px=px_series.dropna()
+    if len(px)<60: return None
 
-regime_features = pd.DataFrame(index=all_closes.index)
+    r=np.log(px/px.shift(1)).dropna()
+    drift=r.mean()
+    vol=float(vol_series.dropna().iloc[-1])
+    s0=float(px.iloc[-1])
 
-try:
-    spy_returns = returns['SPY'] * 100
-    
-    model = MarkovRegression(
-        spy_returns.dropna(),
-        k_regimes=3,
-        switching_variance=True
+    sims=np.zeros((n_sims,horizon_days))
+    for i in range(n_sims):
+        s=s0
+        for t in range(horizon_days):
+            shock=stats.t.rvs(df_t)*vol
+            jump=np.random.normal(jump_mu,jump_sigma) if np.random.rand()<jump_prob else 0
+            s=s*np.exp(drift+shock+jump)
+            sims[i,t]=s
+    terminal=sims[:,-1]
+    return {
+        "expected_return":np.mean(terminal/s0-1),
+        "prob_up": float(np.mean(terminal>s0)),
+        "prob_down":float(np.mean(terminal<=s0)),
+        "confidence": float(max(np.mean(terminal>s0),np.mean(terminal<=s0))),
+        "terminal_dist":terminal
+    }
+
+
+# ----------------------------
+# 14) SCORECARDS + COMPOSITE
+# ----------------------------
+def macro_score_cards(macro,corr,current_regime_name,current_regime,oil_tkr):
+
+    spy_f={
+        "Fed policy":{
+            "status":f"10Y {macro.get('yield_10y',0):.2f}%",
+            "impact":"NEGATIVE" if macro.get("yield_10y",0)>4.5 else "POSITIVE",
+            "reasoning":"Rates high = headwind" if macro.get("yield_10y",0)>4.5 else "Rates supportive"
+        },
+        "Recession risk":{
+            "status":macro.get("recession_risk","Low"),
+            "impact":"NEGATIVE" if macro.get("recession_risk")=="High" else "NEUTRAL",
+            "reasoning":"Demand risk if recession high"
+        },
+        "Credit":{
+            "status":"STRESS" if macro.get("credit_stress",False) else "STABLE",
+            "impact":"NEGATIVE" if macro.get("credit_stress") else "POSITIVE",
+            "reasoning":"Credit stress hurts risk assets"
+        },
+        "Liquidity":{
+            "status":macro.get("liquidity_proxy","Normal"),
+            "impact":"POSITIVE" if macro.get("liquidity_proxy")=="High" else "NEUTRAL",
+            "reasoning":"High liquidity helps risk"
+        },
+        "Volatility":{
+            "status":f"VIX {macro.get('vix_current',0):.1f}",
+            "impact":"NEGATIVE" if macro.get("vix_current",15)>25 else "POSITIVE",
+            "reasoning":"High vol reduces risk appetite"
+        },
+        "Regime":{
+            "status":current_regime_name,
+            "impact":"POSITIVE" if current_regime==0 else ("NEUTRAL" if current_regime==1 else "NEGATIVE"),
+            "reasoning":"Regime sets backdrop"
+        }
+    }
+
+    qqq_f={
+        "Rates":{
+            "status":f"10Y {macro.get('yield_10y',0):.2f}%",
+            "impact":"NEGATIVE" if macro.get("yield_10y",0)>4 else "POSITIVE",
+            "reasoning":"Tech very rate-sensitive"
+        },
+        "USD":{
+            "status":macro.get("dxy_strength","Neutral"),
+            "impact":"NEGATIVE" if macro.get("dxy_strength")=="Strong" else "POSITIVE",
+            "reasoning":"Strong USD hurts overseas earnings"
+        },
+        "Regime":{
+            "status":current_regime_name,
+            "impact":"POSITIVE" if current_regime==0 else "NEGATIVE",
+            "reasoning":"Bull regime helps tech"
+        }
+    }
+
+    oil_f={
+        "Demand proxy":{
+            "status": f"SPY-Oil corr60 {corr.loc['SPY',oil_tkr]:.2f}" if oil_tkr in corr else "N/A",
+            "impact":"NEUTRAL","reasoning":"Demand linked to growth"
+        },
+        "OPEC policy":{"status":"CONSTRAINED","impact":"BULLISH","reasoning":"Cuts support oil"},
+        "USD strength":{
+            "status":macro.get("dxy_strength","Neutral"),
+            "impact":"NEGATIVE" if macro.get("dxy_strength")=="Strong" else "NEUTRAL",
+            "reasoning":"Strong USD reduces affordability"
+        },
+        "Recession":{
+            "status":macro.get("recession_risk","Low"),
+            "impact":"NEGATIVE" if macro.get("recession_risk")=="High" else "NEUTRAL",
+            "reasoning":"Recession reduces demand"
+        }
+    }
+
+    gold_f={
+        "Rates":{
+            "status":f"10Y {macro.get('yield_10y',0):.2f}%",
+            "impact":"NEGATIVE" if macro.get("yield_10y",0)>4 else "POSITIVE",
+            "reasoning":"High real rates hurt gold"
+        },
+        "USD":{
+            "status":macro.get("dxy_strength","Neutral"),
+            "impact":"NEGATIVE" if macro.get("dxy_strength")=="Strong" else "POSITIVE",
+            "reasoning":"Gold moves inverse USD"
+        },
+        "Safe haven":{
+            "status":current_regime_name,
+            "impact":"POSITIVE" if current_regime==2 else "NEUTRAL",
+            "reasoning":"Risk-off regime supports gold"
+        }
+    }
+
+    return spy_f,qqq_f,oil_f,gold_f
+
+def composite_score(factors):
+    return sum(
+        +1 if f["impact"] in ["POSITIVE","BULLISH"] else
+        -1 if f["impact"] in ["NEGATIVE","BEARISH"] else 0
+        for f in factors.values()
     )
-    
-    res = model.fit(maxiter=100, disp=False, warn_convergence=False)
-    
-    smoothed = res.smoothed_marginal_probabilities
-    regime_features['regime_0_prob'] = smoothed[0]
-    regime_features['regime_1_prob'] = smoothed[1]
-    regime_features['regime_2_prob'] = smoothed[2]
-    regime_features['regime_current'] = smoothed.idxmax(axis=1)
-    
-    for i in range(3):
-        vol = np.sqrt(res.params[f'sigma2[{i}]'])
-        regime_features[f'regime_{i}_vol'] = vol
-    
-    print("  ✓ Markov Regime-Switching model fitted")
-    
-except Exception as e:
-    print(f"  Note: Using volatility-based regime detection: {e}")
-    vol = returns['SPY'].rolling(20).std()
-    vol_z = (vol - vol.rolling(60).mean()) / vol.rolling(60).std()
-    
-    regime_features['regime_current'] = pd.cut(
-        vol_z,
-        bins=[-np.inf, -0.5, 0.5, np.inf],
-        labels=[0, 1, 2]
-    ).astype(float)
 
-for ticker in assets.keys():
-    features_dict[ticker] = pd.concat([features_dict[ticker], regime_features], axis=1)
 
-print(f"✓ Added regime detection features")
+# ----------------------------
+# 15) MAIN PIPELINE
+# ----------------------------
+def run_system():
+    print("="*80)
+    print("MULTI-ASSET MACRO-QUANT OIL-FIRST SYSTEM V3 (COLAB-NATIVE)")
+    print("="*80)
 
-# ============================================================================
-# SECTION 7: PREPARE ML DATASETS
-# ============================================================================
+    # ========== 1) DATA ================
+    asset_data, indicator_data = collect_market_data()
+    asset_closes, asset_opens, asset_highs, asset_lows, asset_volumes = extract_ohlcv(asset_data)
+    indicator_closes, *_ = extract_ohlcv(indicator_data)
 
-print("\n[7/12] Preparing machine learning datasets...")
+    all_closes = pd.concat([asset_closes, indicator_closes], axis=1).ffill(limit=5).dropna()
+    returns = all_closes.pct_change().dropna()
 
-def prepare_ml_dataset(ticker, horizon='5d', target_type='binary'):
-    """Prepare features and targets for ML training"""
-    
-    X = features_dict[ticker].copy()
-    
-    target_col = f'{horizon}_{target_type}'
-    if target_col not in targets[ticker].columns:
-        raise ValueError(f"Target {target_col} not found for {ticker}")
-    
-    y = targets[ticker][target_col]
-    
-    data = pd.concat([X, y.rename('target')], axis=1)
-    data = data.dropna(subset=['target'])
-    
-    if len(data) == 0:
-        raise ValueError(f"No valid data after alignment for {ticker} - {horizon}")
-    
-    X_clean = data.drop('target', axis=1)
-    y_clean = data['target']
-    
-    X_clean = X_clean.replace([np.inf, -np.inf], np.nan)
-    
-    for col in X_clean.columns:
-        if X_clean[col].isna().all():
-            X_clean[col] = 0
-        else:
-            X_clean[col] = X_clean[col].fillna(X_clean[col].median())
-    
-    if X_clean.isna().any().any():
-        X_clean = X_clean.fillna(0)
-    
-    return X_clean, y_clean
+    oil_tkr = "CL=F" if "CL=F" in asset_closes.columns else "BZ=F"
+    oil_px = float(asset_closes[oil_tkr].iloc[-1])
 
-ml_datasets = {}
+    targets = make_targets(asset_closes)
 
-for ticker in assets.keys():
-    try:
-        print(f"  Preparing {ticker}...", end='')
-        X, y = prepare_ml_dataset(ticker, horizon='5d', target_type='binary')
-        
-        if len(X) < 100:
-            print(f" ⚠ Insufficient data ({len(X)} samples) - skipping")
+    # ========== 2) VOL + REGIMES ============
+    arch_vols, regimes = {}, {}
+    for tkr in ASSETS:
+        arch_vols[tkr] = fit_best_vol_model(returns[tkr])["vol"]
+        regimes[tkr]    = fit_markov_regime(returns[tkr],3)
+
+    global_regime = regimes["SPY"]
+    current_regime = int(global_regime["regime_current"].dropna().iloc[-1])
+    regime_names = {0:"Low Vol (Bull)",1:"Normal",2:"High Vol (Bear)"}
+    current_regime_name = regime_names.get(current_regime,"Unknown")
+
+    # ========== 3) MACRO ============
+    macro = build_macro_indicators(asset_closes, indicator_closes)
+
+    asset_ret = returns[list(ASSETS.keys())]
+    pca_factors,_ = make_pca_factors(asset_ret,3)
+
+    # ========== 4) FEATURES ===========
+    features={}
+    for tkr in ASSETS:
+        f=engineer_features(
+            tkr, asset_closes, asset_highs, asset_lows, asset_volumes,
+            indicator_closes, returns, macro, arch_vols[tkr], global_regime
+        )
+        f=pd.concat([f, pca_factors.reindex(f.index)],axis=1)
+        features[tkr]=f
+
+    # ========== 5) ML PREDICTIONS ===========
+    models,forward_preds={},{}
+    for tkr in ASSETS:
+        X=features[tkr]
+        y=targets[tkr]["5d_binary"]
+        data=pd.concat([X,y.rename("target")],axis=1).dropna(subset=["target"])
+        if len(data)<300:
+            print(f"[WARN] {tkr} insufficient samples.")
             continue
-        
-        ml_datasets[ticker] = {'X': X, 'y': y}
-        print(f" ✓ {len(X)} samples, {X.shape[1]} features")
-        
-    except Exception as e:
-        print(f" ✗ Error: {e}")
-        continue
 
-if not ml_datasets:
-    print("\n❌ ERROR: Failed to prepare any ML datasets!")
-    raise SystemExit("Cannot proceed without valid datasets")
+        Xc,yc=data.drop("target",axis=1),data["target"]
+        mdl=time_series_train_best(Xc,yc)
+        if mdl is None:
+            print(f"[WARN] {tkr} ML failed")
+            continue
 
-print(f"\n✓ Prepared ML datasets for {len(ml_datasets)} assets")
-
-# ============================================================================
-# SECTION 8: TRAIN ML MODELS
-# ============================================================================
-
-print("\n[8/12] Training machine learning models...")
-
-models = {}
-predictions = {}
-performance = {}
-
-for ticker in assets.keys():
-    if ticker not in ml_datasets:
-        print(f"  ⚠ Skipping {ticker} - no valid dataset")
-        continue
-    
-    print(f"\n  Training models for {ticker} ({assets[ticker]})...")
-    
-    X = ml_datasets[ticker]['X']
-    y = ml_datasets[ticker]['y']
-    
-    if len(X) < 100:
-        print(f"    ⚠ Insufficient data ({len(X)} samples) - skipping")
-        continue
-    
-    train_size = int(len(X) * 0.7)
-    
-    if train_size < 50:
-        print(f"    ⚠ Training set too small ({train_size} samples) - skipping")
-        continue
-    
-    X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
-    y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
-    
-    if len(X_train) == 0 or len(X_test) == 0:
-        print(f"    ⚠ Empty train or test set - skipping")
-        continue
-    
-    print(f"    Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-    
-    scaler = RobustScaler()
-    try:
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-    except Exception as e:
-        print(f"    ⚠ Scaling failed: {e} - skipping")
-        continue
-    
-    model_dict = {}
-    
-    # Logistic Regression
-    try:
-        lr = LogisticRegression(max_iter=1000, random_state=42, class_weight='balanced')
-        lr.fit(X_train_scaled, y_train)
-        model_dict['LogisticRegression'] = lr
-    except:
-        pass
-    
-    # Random Forest
-    try:
-        rf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=20,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            max_features='sqrt',
-            random_state=42,
-            class_weight='balanced',
-            n_jobs=-1
-        )
-        rf.fit(X_train_scaled, y_train)
-        model_dict['RandomForest'] = rf
-    except:
-        pass
-    
-    # Gradient Boosting
-    try:
-        gb = GradientBoostingClassifier(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.03,
-            subsample=0.8,
-            min_samples_split=20,
-            min_samples_leaf=10,
-            random_state=42
-        )
-        gb.fit(X_train_scaled, y_train)
-        model_dict['GradientBoosting'] = gb
-    except:
-        pass
-    
-    # XGBoost
-    try:
-        xgb_model = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            use_label_encoder=False,
-            eval_metric='logloss'
-        )
-        xgb_model.fit(X_train_scaled, y_train)
-        model_dict['XGBoost'] = xgb_model
-    except:
-        pass
-    
-    # LightGBM
-    try:
-        lgb_model = lgb.LGBMClassifier(
-            n_estimators=200,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            verbose=-1
-        )
-        lgb_model.fit(X_train_scaled, y_train)
-        model_dict['LightGBM'] = lgb_model
-    except:
-        pass
-    
-    # Ensemble
-    if len(model_dict) >= 3:
-        voting_clf = VotingClassifier(
-            estimators=[(name, model) for name, model in model_dict.items()],
-            voting='soft'
-        )
-        voting_clf.fit(X_train_scaled, y_train)
-        model_dict['Ensemble'] = voting_clf
-    
-    # Evaluate models
-    results = {}
-    for name, model in model_dict.items():
-        y_pred = model.predict(X_test_scaled)
-        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1] if hasattr(model, 'predict_proba') else None
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        
-        results[name] = {
-            'accuracy': accuracy,
-            'y_pred': y_pred,
-            'y_pred_proba': y_pred_proba
+        models[tkr]=mdl
+        latest=Xc.iloc[-1:]
+        latest_scaled=mdl["scaler"].transform(latest)
+        pred_class=int(mdl["best_model"].predict(latest_scaled)[0])
+        pred_prob=mdl["best_model"].predict_proba(latest_scaled)[0]
+        conf=float(pred_prob.max())
+        forward_preds[tkr]={
+            "prediction_class":pred_class,
+            "prediction_direction":"UP" if pred_class==1 else "DOWN/FLAT",
+            "confidence":conf,
+            "prob_up": float(pred_prob[1]),
+            "prob_down":float(pred_prob[0]),
+            "model_used":mdl["best_name"],
+            "cv_score":mdl["cv_score"],
+            "current_price":float(asset_closes[tkr].iloc[-1])
         }
-        
-        print(f"    {name}: {accuracy:.2%} accuracy")
-    
-    best_model_name = max(results, key=lambda x: results[x]['accuracy'])
-    best_model = model_dict[best_model_name]
-    
-    print(f"    → Best: {best_model_name} ({results[best_model_name]['accuracy']:.2%})")
-    
-    models[ticker] = {
-        'scaler': scaler,
-        'best_model': best_model,
-        'best_model_name': best_model_name,
-        'all_models': model_dict,
-        'feature_names': X.columns.tolist()
-    }
-    
-    predictions[ticker] = {
-        'y_test': y_test,
-        'y_pred': results[best_model_name]['y_pred'],
-        'y_pred_proba': results[best_model_name]['y_pred_proba'],
-        'X_test_index': X_test.index
-    }
-    
-    performance[ticker] = {
-        'accuracy': results[best_model_name]['accuracy'],
-        'model_used': best_model_name
+
+    # ========== 6) MONTE CARLO ===========
+    mc_forecasts={tkr: monte_carlo_forecast(asset_closes[tkr], arch_vols[tkr],5,5000)
+                  for tkr in ASSETS}
+
+    # ========== 7) RISK ===========
+    risk={tkr: risk_metrics(returns[tkr]) for tkr in ASSETS}
+
+    # ========== 8) MACRO SCORES ===========
+    corr60 = asset_ret.tail(60).corr()
+    spy_f,qqq_f,oil_f,gold_f = macro_score_cards(
+        macro,corr60,current_regime_name,current_regime,oil_tkr
+    )
+
+    scores={
+        "SPY": composite_score(spy_f),
+        "QQQ": composite_score(qqq_f),
+        oil_tkr: composite_score(oil_f),
+        "GLD": composite_score(gold_f)
     }
 
-print(f"\n✓ Trained models for all {len(models)} assets")
+    # ========== 9) COMBINED SIGNAL ===========
+    combined={}
+    for tkr in ASSETS:
+        macro_rating = ("BULLISH" if scores.get(tkr,0)>1
+                         else "BEARISH" if scores.get(tkr,0)<-1
+                         else "NEUTRAL")
 
-# ============================================================================
-# SECTION 9: FEATURE IMPORTANCE ANALYSIS
-# ============================================================================
+        ml   = forward_preds.get(tkr,{})
+        mc   = mc_forecasts.get(tkr,{})
+        ml_d = ml.get("prediction_direction","N/A")
+        mc_d = "UP" if (mc and mc["prob_up"]>0.55) else "DOWN/FLAT"
 
-print("\n[9/12] Analyzing feature importance...")
+        if macro_rating=="BULLISH" and ml_d=="UP" and mc_d=="UP" and ml.get("confidence",0)>0.65:
+            combined[tkr]="🟢 STRONG BUY"
+        elif macro_rating=="BEARISH" and ml_d!="UP" and mc_d!="UP" and ml.get("confidence",0)>0.65:
+            combined[tkr]="🔴 STRONG SELL"
+        elif macro_rating=="BULLISH" or ml_d=="UP":
+            combined[tkr]="🟢 MODERATE BUY"
+        elif macro_rating=="BEARISH" or ml_d!="UP":
+            combined[tkr]="🔴 MODERATE SELL"
+        else:
+            combined[tkr]="🟡 HOLD"
 
-feature_importance_dict = {}
+    # ========== 10) OUTPUT ===========
+    print("\n" + "="*80)
+    print("OIL-FIRST SUMMARY")
+    print("="*80)
+    print(f"Oil ticker: {oil_tkr}   Price: ${oil_px:.2f}")
+    print(f"Regime: {current_regime_name}")
+    print(f"Oil Macro Score: {scores.get(oil_tkr,0):+d}/{len(oil_f)}")
+    print(f"Oil ML: {forward_preds.get(oil_tkr,{})}")
+    print(f"Oil MC: {{'expected_return': {mc_forecasts.get(oil_tkr,{}).get('expected_return')}, 'prob_up': {mc_forecasts.get(oil_tkr,{}).get('prob_up')}}}")
+    print(f"Oil Signal: {combined.get(oil_tkr)}")
 
-for ticker in assets.keys():
-    if ticker not in models:
-        continue
-    
-    model = models[ticker]['best_model']
-    feature_names = models[ticker]['feature_names']
-    
-    if hasattr(model, 'feature_importances_'):
-        importance = model.feature_importances_
-        feature_importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importance
-        }).sort_values('importance', ascending=False)
-        
-        feature_importance_dict[ticker] = feature_importance_df
-        
-        print(f"\n  Top 10 features for {ticker}:")
-        print(feature_importance_df.head(10)[['feature', 'importance']].to_string(index=False))
+    print("\n🛢️ WTI Fundamentals:")
+    for k,v in oil_f.items():
+        print(f"\n{k}")
+        print("  Status:", v["status"])
+        print("  Impact:", v["impact"])
+        print("  Reason:", v["reasoning"])
 
-for ticker, df in feature_importance_dict.items():
-    df.to_csv(f'feature_importance_{ticker}.csv', index=False)
+    print("\n" + "="*80)
+    print("ALL-ASSET SIGNALS")
+    print("="*80)
+    for tkr in ASSETS:
+        ml=forward_preds.get(tkr,{})
+        mc=mc_forecasts.get(tkr,{})
+        print(f"\n{tkr} ({ASSETS[tkr]})")
+        print(f"  Price: ${ml.get('current_price',np.nan):.2f}")
+        print(f"  Macro Score: {scores.get(tkr,0):+d}")
+        print(f"  ML Dir: {ml.get('prediction_direction','N/A')} Conf: {ml.get('confidence',0):.1%}  Model: {ml.get('model_used','N/A')}")
+        if mc and mc.get("prob_up") is not None:
+            print(f"  MC Prob Up: {mc['prob_up']:.1%}  ExpRet(5d): {mc['expected_return']:.2%}")
+        print(f"  Combined: {combined.get(tkr)}")
+        print(f"  Risk: Sharpe {risk[tkr].get('sharpe',0):.2f}, VaR95 {risk[tkr].get('VaR_95',0):.2%}")
 
-# ============================================================================
-# SECTION 10: GENERATE PREDICTIONS
-# ============================================================================
+    # ======================================================
+    # ULTRA-SAFE CSV SAVER (NO pandas.to_csv USED)
+    # ======================================================
+    import csv
 
-print("\n[10/12] Generating forward predictions...")
+    def ultra_safe_to_csv(df, path):
+        out = df.copy()
+        out.index  = [str(i) for i in out.index]
+        out.columns = [str(c) for c in out.columns]
 
-forward_predictions = {}
+        out = out.reset_index()
+        out = out.astype(object).where(pd.notnull(out), "")
 
-for ticker in assets.keys():
-    if ticker not in models:
-        print(f"  ⚠ No trained model for {ticker} - skipping prediction")
-        continue
-    
-    try:
-        latest_features = features_dict[ticker].iloc[-1:].copy()
-        latest_features = latest_features.replace([np.inf, -np.inf], np.nan)
-        
-        for col in latest_features.columns:
-            if latest_features[col].isna().all() or pd.isna(latest_features[col].iloc[0]):
-                median_val = features_dict[ticker][col].median()
-                if pd.isna(median_val):
-                    latest_features[col] = 0
-                else:
-                    latest_features[col] = median_val
-        
-        scaler = models[ticker]['scaler']
-        latest_scaled = scaler.transform(latest_features)
-        
-        model = models[ticker]['best_model']
-        pred_class = model.predict(latest_scaled)[0]
-        pred_proba = model.predict_proba(latest_scaled)[0] if hasattr(model, 'predict_proba') else None
-        
-        current_price = float(asset_closes[ticker].iloc[-1])
-        
-        forward_predictions[ticker] = {
-            'current_price': current_price,
-            'prediction_class': int(pred_class),
-            'prediction_direction': 'UP' if pred_class == 1 else 'DOWN/FLAT',
-            'probability_up': float(pred_proba[1]) if pred_proba is not None else None,
-            'probability_down': float(pred_proba[0]) if pred_proba is not None else None,
-            'confidence': float(max(pred_proba)) if pred_proba is not None else None,
-            'model_used': models[ticker]['best_model_name']
-        }
-    except Exception as e:
-        print(f"  ⚠ Prediction failed for {ticker}: {e}")
-        continue
+        header = list(out.columns)
+        rows = out.values.tolist()
 
-if not forward_predictions:
-    print("\n⚠ WARNING: No forward predictions generated!")
-else:
-    print("\n" + "=" * 80)
-    print("PREDICTIONS FOR NEXT 5 DAYS")
-    print("=" * 80)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
 
-    for ticker, pred in forward_predictions.items():
-        ticker_name = assets[ticker]
-        if ticker == oil_ticker:
-            ticker_name += f" - Current: ${pred['current_price']:.2f}/barrel"
-        
-        print(f"\n{ticker} ({ticker_name}):")
-        print(f"  Current Price: ${pred['current_price']:.2f}")
-        print(f"  Prediction: {pred['prediction_direction']}")
-        if pred['probability_up'] is not None:
-            print(f"  Probability UP: {pred['probability_up']:.1%}")
-            print(f"  Confidence: {pred['confidence']:.1%}")
-        print(f"  Model: {pred['model_used']}")
+    # Save artifacts
+    pred_df  = pd.DataFrame(forward_preds).T
+    score_df = pd.DataFrame(scores, index=["macro_score"]).T
+    risk_df  = pd.DataFrame(risk).T
+    comb_df  = pd.DataFrame(combined, index=["combined_signal"]).T
 
-    pd.DataFrame(forward_predictions).T.to_csv('forward_predictions_5d.csv')
-    print("\n✓ Saved predictions to forward_predictions_5d.csv")
+    ultra_safe_to_csv(pred_df,  "forward_predictions_5d.csv")
+    ultra_safe_to_csv(score_df, "macro_scores.csv")
+    ultra_safe_to_csv(risk_df,  "risk_metrics.csv")
+    ultra_safe_to_csv(comb_df,  "combined_signals.csv")
 
-# ============================================================================
-# SECTION 11: BACKTEST PERFORMANCE ANALYSIS
-# ============================================================================
+    print("\n✅ Files saved:")
+    print("  - forward_predictions_5d.csv")
+    print("  - macro_scores.csv")
+    print("  - risk_metrics.csv")
+    print("  - combined_signals.csv")
+    print("\n⚠️ Educational use only.")
 
-print("\n[11/12] Analyzing backtest performance...")
 
-backtest_results = {}
-
-for ticker in assets.keys():
-    if ticker not in predictions:
-        continue
-    
-    y_test = predictions[ticker]['y_test']
-    y_pred = predictions[ticker]['y_pred']
-    y_pred_proba = predictions[ticker]['y_pred_proba']
-    test_dates = predictions[ticker]['X_test_index']
-    
-    accuracy = accuracy_score(y_test, y_pred)
-    
-    cm = confusion_matrix(y_test, y_pred)
-    
-    if cm.shape == (2, 2):
-        tn, fp, fn, tp = cm.ravel()
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    else:
-        precision = recall = f1 = 0
-    
-    try:
-        roc_auc = roc_auc_score(y_test, y_pred_proba) if y_pred_proba is not None else None
-    except:
-        roc_auc = None
-    
-    test_returns = asset_closes[ticker].loc[test_dates].pct_change().shift(-5)
-    test_returns = test_returns.iloc[:-5]
-    y_pred_aligned = y_pred[:-5] if len(y_pred) > len(test_returns) else y_pred[:len(test_returns)]
-    
-    strategy_returns = test_returns * y_pred_aligned
-    strategy_returns = strategy_returns.dropna()
-    
-    buy_hold_returns = test_returns.dropna()
-    
-    if len(strategy_returns) > 0:
-        total_strategy_return = (1 + strategy_returns).prod() - 1
-        total_buy_hold_return = (1 + buy_hold_returns).prod() - 1
-        
-        sharpe_strategy = strategy_returns.mean() / strategy_returns.std() * np.sqrt(252) if strategy_returns.std() > 0 else 0
-        sharpe_buy_hold = buy_hold_returns.mean() / buy_hold_returns.std() * np.sqrt(252) if buy_hold_returns.std() > 0 else 0
-        
-        max_dd_strategy = (strategy_returns.cumsum() - strategy_returns.cumsum().cummax()).min()
-        max_dd_buy_hold = (buy_hold_returns.cumsum() - buy_hold_returns.cumsum().cummax()).min()
-        
-        win_rate = (strategy_returns > 0).sum() / len(strategy_returns)
-    else:
-        total_strategy_return = 0
-        total_buy_hold_return = 0
-        sharpe_strategy = 0
-        sharpe_buy_hold = 0
-        max_dd_strategy = 0
-        max_dd_buy_hold = 0
-        win_rate = 0
-    
-    backtest_results[ticker] = {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'roc_auc': roc_auc,
-        'total_strategy_return': total_strategy_return * 100,
-        'total_buy_hold_return': total_buy_hold_return * 100,
-        'sharpe_strategy': sharpe_strategy,
-        'sharpe_buy_hold': sharpe_buy_hold,
-        'max_drawdown_strategy': max_dd_strategy * 100,
-        'max_drawdown_buy_hold': max_dd_buy_hold * 100,
-        'win_rate': win_rate,
-        'outperformance': (total_strategy_return - total_buy_hold_return) * 100
-    }
-
-backtest_df = pd.DataFrame(backtest_results).T
-backtest_df.to_csv('backtest_performance.csv')
-
-print("\nBacktest Performance Summary:")
-print("=" * 80)
-print(backtest_df[['accuracy', 'sharpe_strategy', 'sharpe_buy_hold', 'outperformance']].to_string())
-
-# ============================================================================
-# SECTION 12: CORRELATION ANALYSIS & FINAL REPORTS
-# ============================================================================
-
-print("\n[12/12] Performing final analysis...")
-
-# Correlation matrix
-recent_returns = returns[list(assets.keys())].tail(60)
-corr_matrix = recent_returns.corr()
-
-print("\nCurrent 60-Day Correlation Matrix:")
-print(corr_matrix.round(3).to_string())
-corr_matrix.to_csv('asset_correlation_matrix.csv')
-
-# Rolling correlations - NO USO
-rolling_corr = {}
-
-oil_ticker_name = oil_ticker if oil_ticker else 'CL=F'
-
-pairs = [
-    ('SPY', 'QQQ', 'Stocks Correlation'),
-    ('SPY', 'GLD', 'Stocks vs Gold'),
-]
-
-if oil_ticker_name in returns.columns:
-    pairs.extend([
-        ('SPY', oil_ticker_name, 'Stocks vs Oil'),
-        (oil_ticker_name, 'GLD', 'Oil vs Gold'),
-    ])
-
-pairs.append(('QQQ', 'GLD', 'Tech vs Gold'))
-
-for ticker1, ticker2, label in pairs:
-    if ticker1 in returns.columns and ticker2 in returns.columns:
-        rolling_corr[label] = returns[ticker1].rolling(60).corr(returns[ticker2])
-
-if rolling_corr:
-    rolling_corr_df = pd.DataFrame(rolling_corr)
-    rolling_corr_df.to_csv('rolling_correlations.csv')
-    print("\nCurrent Rolling Correlations:")
-    print(rolling_corr_df.tail(1).to_string())
-
-# Market regime
-current_regime = int(regime_features['regime_current'].iloc[-1])
-regime_names = {0: 'Low Volatility (Bull)', 1: 'Normal', 2: 'High Volatility (Bear)'}
-current_regime_name = regime_names.get(current_regime, 'Unknown')
-
-print("\n" + "=" * 80)
-print("MARKET REGIME & TRADING SIGNALS")
-print("=" * 80)
-print(f"\nCurrent Market Regime: {current_regime_name}")
-
-# Trading signals
-for ticker, pred in forward_predictions.items():
-    signal = "🟢 BUY" if pred['prediction_direction'] == 'UP' and pred['confidence'] > 0.65 else \
-             "🔴 SELL" if pred['prediction_direction'] == 'DOWN/FLAT' and pred['confidence'] > 0.65 else \
-             "🟡 HOLD"
-    
-    print(f"\n{signal} {ticker} ({assets[ticker]})")
-    print(f"  Price: ${pred['current_price']:.2f}")
-    print(f"  Direction: {pred['prediction_direction']} ({pred['confidence']:.1%} confidence)")
-    print(f"  Model: {pred['model_used']}")
-
-# Summary report
-summary = {
-    'analysis_timestamp': datetime.utcnow().isoformat(),
-    'market_regime': current_regime_name,
-    'oil_source': oil_source if oil_ticker_used else 'N/A',
-    'oil_price': current_oil_price if oil_ticker_used else None,
-    'assets_analyzed': list(assets.keys()),
-    'predictions': {
-        ticker: {
-            'direction': forward_predictions[ticker]['prediction_direction'],
-            'confidence': forward_predictions[ticker]['confidence'],
-            'current_price': forward_predictions[ticker]['current_price']
-        }
-        for ticker in forward_predictions.keys()
-    },
-    'backtest_performance': {
-        ticker: {
-            'accuracy': backtest_results[ticker]['accuracy'],
-            'sharpe_strategy': backtest_results[ticker]['sharpe_strategy'],
-            'outperformance': backtest_results[ticker]['outperformance']
-        }
-        for ticker in backtest_results.keys()
-    }
-}
-
-with open('analysis_summary.json', 'w') as f:
-    json.dump(summary, f, indent=2)
-
-metadata = {
-    'system': 'Multi-Asset Market Movement Prediction System V2',
-    'version': '2.0 - CL=F Oil Futures',
-    'timestamp_utc': pd.Timestamp.utcnow().isoformat(),
-    'python_version': sys.version.split()[0],
-    'assets_tracked': list(assets.keys()),
-    'oil_ticker_used': oil_ticker_used,
-    'features_per_asset': len(features_dict[list(assets.keys())[0]].columns),
-    'models_used': ['Logistic Regression', 'Random Forest', 'Gradient Boosting', 'XGBoost', 'LightGBM', 'Ensemble'],
-    'prediction_horizons': list(horizons.keys()),
-    'data_period': f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
-    'total_trading_days': len(all_closes)
-}
-
-with open('system_metadata.json', 'w') as f:
-    json.dump(metadata, f, indent=2)
-
-print("\n" + "=" * 80)
-print("ANALYSIS COMPLETE!")
-print("=" * 80)
-
-print("\n✅ Generated files:")
-print("   - forward_predictions_5d.csv")
-print("   - backtest_performance.csv")
-print("   - asset_correlation_matrix.csv")
-print("   - rolling_correlations.csv")
-print("   - feature_importance_*.csv (per asset)")
-print("   - analysis_summary.json")
-print("   - system_metadata.json")
-
-print(f"\n💡 Oil Data: Using {oil_source} at ${current_oil_price:.2f}/barrel")
-print(f"📊 Market Regime: {current_regime_name}")
-print("\n⚠️  Disclaimer: For educational purposes only.")
-print("    Always conduct your own research before trading.")
-print("\nHappy Trading! 🚀📊")
+# ---------------------------------------------------------
+# RUN SYSTEM
+# ---------------------------------------------------------
+run_system()
