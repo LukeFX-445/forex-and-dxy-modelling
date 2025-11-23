@@ -1,0 +1,824 @@
+# ============================================================
+# SPX + NASDAQ Macro-Quant Forecasting System V1 (COLAB-NATIVE)
+# Focus: SPY (S&P500) and QQQ (NASDAQ-100)
+# - Colab-safe, no core downgrades
+# - arch OPTIONAL (fallback vol if incompatible)
+# - Macro features aligned to your key-driver lists
+# - Numeric macro encoding to avoid pandas median/type bugs
+# - FIX: ultra-safe CSV writer bypassing pandas formatter
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# ----------------------------
+# 0) COLAB-NATIVE INSTALL CELL
+# ----------------------------
+!pip install -q --upgrade pip
+!pip install -q yfinance statsmodels xgboost vaderSentiment feedparser
+
+# Optional: arch (often incompatible with NumPy2 -> fallback vol will be used)
+ARCH_AVAILABLE, _arch_err = False, None
+try:
+    !pip install -q arch
+    from arch import arch_model
+    ARCH_AVAILABLE = True
+except Exception as e:
+    _arch_err = e
+    ARCH_AVAILABLE = False
+
+print("✅ Colab core stack (left untouched).")
+import numpy as np, pandas as pd, scipy, sklearn
+print("numpy:", np.__version__, "| pandas:", pd.__version__, "| scipy:", scipy.__version__, "| sklearn:", sklearn.__version__)
+print("arch available:", ARCH_AVAILABLE)
+if _arch_err: print("arch import/install error:", _arch_err)
+
+# ----------------------------
+# 1) IMPORTS
+# ----------------------------
+import yfinance as yf
+from datetime import datetime, timedelta
+from scipy import stats
+import csv  # ✅ for safe CSV writing
+
+from sklearn.preprocessing import RobustScaler
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score
+
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+import xgboost as xgb
+
+# ----------------------------
+# 2) CONFIG
+# ----------------------------
+SEED = 42
+np.random.seed(SEED)
+
+END_DATE = datetime.utcnow()
+START_DATE = END_DATE - timedelta(days=8 * 365)
+
+ASSETS = {
+    "SPY": "S&P 500 ETF",
+    "QQQ": "NASDAQ-100 ETF"
+}
+
+INDICATORS = {
+    "^VIX": "VIX",
+    "^TNX": "10Y Treasury Yield",
+    "^FVX": "5Y Treasury Yield",
+    "^IRX": "13W T-Bill",
+    "DX-Y.NYB": "DXY",
+    "HYG": "High Yield Credit",
+    "LQD": "Inv Grade Credit",
+    "IWM": "US Small Caps",
+    "XLE": "Energy Sector",
+    "SOXX": "Semis ETF",
+    "SMH": "Semis ETF alt",
+    "TLT": "Long bonds",
+    "USO": "Oil ETF"
+}
+
+HORIZONS = {"1d":1, "3d":3, "5d":5, "10d":10, "20d":20}
+DIR_BINS   = [-np.inf, -0.5, 0.5, np.inf]
+DIR_LABELS = [-1, 0, 1]
+
+# ----------------------------
+# 3) UTILITIES
+# ----------------------------
+def download_single(ticker: str):
+    data = yf.download(ticker, start=START_DATE, end=END_DATE,
+                       progress=False, auto_adjust=False)
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.xs(ticker, axis=1, level=1)
+    return data
+
+def safe_pct_change(x, n=1):
+    return x.pct_change(n).replace([np.inf, -np.inf], np.nan)
+
+def zscore(series, window):
+    mu = series.rolling(window).mean()
+    sig = series.rolling(window).std()
+    return (series - mu) / sig.replace(0, np.nan)
+
+def winsorize_series(s, p=0.01):
+    lo, hi = s.quantile(p), s.quantile(1-p)
+    return s.clip(lo, hi)
+
+def extract_ohlcv(data_dict):
+    closes, opens, highs, lows, volumes = {}, {}, {}, {}, {}
+    for tkr, d in data_dict.items():
+        if "Close" in d: closes[tkr] = d["Close"]
+        if "Open" in d: opens[tkr] = d["Open"]
+        if "High" in d: highs[tkr] = d["High"]
+        if "Low" in d: lows[tkr] = d["Low"]
+        if "Volume" in d: volumes[tkr] = d["Volume"]
+    return (pd.DataFrame(closes),
+            pd.DataFrame(opens),
+            pd.DataFrame(highs),
+            pd.DataFrame(lows),
+            pd.DataFrame(volumes))
+
+# ----------------------------
+# 4) DATA COLLECTION
+# ----------------------------
+def collect_market_data():
+    asset_data, indicator_data = {}, {}
+    for tkr in ASSETS:
+        d = download_single(tkr)
+        if not d.empty and len(d) > 200:
+            asset_data[tkr] = d
+    for tkr in INDICATORS:
+        try:
+            d = download_single(tkr)
+            if not d.empty and len(d) > 200:
+                indicator_data[tkr] = d
+        except Exception:
+            continue
+    return asset_data, indicator_data
+
+# ----------------------------
+# 5) MACRO PROXIES
+# ----------------------------
+def build_macro_indicators(asset_closes, indicator_closes):
+    macro = {}
+
+    if "^TNX" in indicator_closes:
+        tnx = indicator_closes["^TNX"]
+        macro["yield_10y"] = float(tnx.iloc[-1])
+        macro["yield_10y_1m_change"] = float(tnx.diff(21).iloc[-1])
+        macro["yield_10y_3m_change"] = float(tnx.diff(63).iloc[-1])
+
+    if "^IRX" in indicator_closes:
+        irx = indicator_closes["^IRX"]
+        macro["yield_frontend"] = float(irx.iloc[-1])
+
+    if "^FVX" in indicator_closes and "^TNX" in indicator_closes:
+        fvx = indicator_closes["^FVX"]
+        tnx = indicator_closes["^TNX"]
+        macro["curve_5y10y"] = float(fvx.iloc[-1] - tnx.iloc[-1])
+
+    if "DX-Y.NYB" in indicator_closes:
+        dxy = indicator_closes["DX-Y.NYB"]
+        macro["dxy_current"] = float(dxy.iloc[-1])
+        macro["dxy_1m_change"] = float(dxy.diff(21).iloc[-1])
+        macro["dxy_strength"] = "Strong" if dxy.iloc[-1] > dxy.rolling(200).mean().iloc[-1] else "Weak"
+
+    if "^VIX" in indicator_closes:
+        vix = indicator_closes["^VIX"]
+        macro["vix_current"] = float(vix.iloc[-1])
+        macro["vix_20d_avg"] = float(vix.rolling(20).mean().iloc[-1])
+        macro["vix_spike"] = bool(vix.iloc[-1] > vix.rolling(20).mean().iloc[-1] +
+                                  vix.rolling(20).std().iloc[-1])
+
+    if "HYG" in indicator_closes and "LQD" in indicator_closes:
+        hyg = indicator_closes["HYG"]
+        lqd = indicator_closes["LQD"]
+        spread_proxy = hyg.pct_change(21).iloc[-1] - lqd.pct_change(21).iloc[-1]
+        macro["credit_spread_proxy"] = float(spread_proxy)
+        macro["credit_stress"] = bool(spread_proxy < -0.03)
+
+    macro["liquidity_proxy"] = "High" if (macro.get("credit_stress") is False and
+                                          macro.get("vix_current", 20) < 20) else "Normal"
+
+    inv_curve = (macro.get("curve_5y10y", 0) < -0.25) and macro.get("credit_stress", False)
+    macro["recession_risk"] = "High" if (inv_curve or macro.get("vix_current", 15) > 30) else "Low"
+
+    for tkr in ["SPY", "QQQ"]:
+        if tkr in asset_closes:
+            px = asset_closes[tkr]
+            macro[f"{tkr.lower()}_mom_3m"] = float(px.pct_change(63).iloc[-1])
+            macro[f"{tkr.lower()}_mom_6m"] = float(px.pct_change(126).iloc[-1])
+
+    if "USO" in indicator_closes:
+        oil = indicator_closes["USO"]
+        macro["oil_mom_3m"] = float(oil.pct_change(63).iloc[-1])
+
+    if "XLE" in indicator_closes:
+        xle = indicator_closes["XLE"]
+        macro["energy_mom_3m"] = float(xle.pct_change(63).iloc[-1])
+
+    for semi in ["SOXX", "SMH"]:
+        if semi in indicator_closes:
+            s = indicator_closes[semi]
+            macro["semis_mom_3m"] = float(s.pct_change(63).iloc[-1])
+            break
+
+    return macro
+
+# ----------------------------
+# 6) TARGETS
+# ----------------------------
+def make_targets(asset_closes):
+    targets = {}
+    for tkr in ASSETS:
+        price = asset_closes[tkr]
+        tdf = {}
+        for hname, d in HORIZONS.items():
+            fwd = price.pct_change(d).shift(-d) * 100
+            tdf[f"{hname}_direction"] = pd.cut(fwd, DIR_BINS, labels=DIR_LABELS).astype(float)
+            tdf[f"{hname}_binary"] = (fwd > 0).astype(int)
+            tdf[f"{hname}_return"] = fwd / 100.0
+        targets[tkr] = pd.DataFrame(tdf, index=price.index)
+    return targets
+
+# ----------------------------
+# 7) VOLATILITY (arch optional)
+# ----------------------------
+def _fit_best_arch(returns_series):
+    r = returns_series.dropna() * 100.0
+    candidates = []
+    specs = [
+        ("GARCH",  "normal", dict(vol="GARCH",  p=1, q=1, o=0, dist="normal")),
+        ("GARCH",  "t",      dict(vol="GARCH",  p=1, q=1, o=0, dist="t")),
+        ("EGARCH", "normal", dict(vol="EGARCH", p=1, q=1, o=0, dist="normal")),
+        ("EGARCH", "t",      dict(vol="EGARCH", p=1, q=1, o=0, dist="t")),
+        ("GJR",    "normal", dict(vol="GARCH",  p=1, q=1, o=1, dist="normal")),
+        ("GJR",    "t",      dict(vol="GARCH",  p=1, q=1, o=1, dist="t")),
+    ]
+    for name, dist, kw in specs:
+        try:
+            am = arch_model(r, mean="Zero", **kw)
+            res = am.fit(disp="off")
+            candidates.append((res.aic, name, dist, res))
+        except Exception:
+            continue
+    if not candidates:
+        raise RuntimeError("arch fit failed for all candidate models.")
+    best_aic, best_name, best_dist, best_res = sorted(candidates, key=lambda x: x[0])[0]
+    cond_vol = best_res.conditional_volatility / 100.0
+    return {"best_name": best_name, "best_dist": best_dist,
+            "aic": float(best_aic), "vol": cond_vol, "res": best_res}
+
+def _fallback_garch11(returns_series, alpha=0.08, beta=0.90):
+    r = returns_series.dropna()
+    if len(r) < 30:
+        vol = r.rolling(20).std()
+        return {"best_name": "ROLLING", "best_dist": None,
+                "aic": np.nan, "vol": vol, "res": None}
+    var0 = float(r.var())
+    omega = var0 * (1 - alpha - beta)
+    h = np.empty(len(r))
+    h[0] = var0
+    for t in range(1, len(r)):
+        h[t] = omega + alpha*(r.iloc[t-1]**2) + beta*h[t-1]
+    vol = pd.Series(np.sqrt(h), index=r.index)
+    return {"best_name": "GARCH_FALLBACK", "best_dist": None,
+            "aic": np.nan, "vol": vol,
+            "res": {"alpha": alpha, "beta": beta, "omega": omega}}
+
+def fit_best_vol_model(returns_series):
+    if ARCH_AVAILABLE:
+        try:
+            out = _fit_best_arch(returns_series)
+            out["engine"] = "arch"
+            return out
+        except Exception as e:
+            print(f"⚠️ arch unusable -> fallback. {type(e).__name__}: {e}")
+    out = _fallback_garch11(returns_series)
+    out["engine"] = "fallback_garch11"
+    return out
+
+# ----------------------------
+# 8) REGIMES
+# ----------------------------
+def fit_markov_regime(returns_series, k=3):
+    r = (returns_series.dropna() * 100).values
+    idx = returns_series.dropna().index
+    try:
+        model = MarkovRegression(r, k_regimes=k, switching_variance=True)
+        res = model.fit(disp=False)
+        probs = res.smoothed_marginal_probabilities
+        out = pd.DataFrame({f"regime_{i}_prob": probs[i] for i in range(k)}, index=idx)
+        out["regime_current"] = out.idxmax(axis=1).str.extract(r"(\d+)").astype(int)
+        return out
+    except Exception:
+        vol = returns_series.rolling(20).std()
+        vz = zscore(vol, 60)
+        rc = pd.cut(vz, [-np.inf, -0.5, 0.5, np.inf], labels=[0,1,2]).astype(float)
+        return pd.DataFrame({"regime_current": rc}, index=returns_series.index)
+
+# ----------------------------
+# 9) FEATURES (macro strings encoded numeric)
+# ----------------------------
+def encode_macro_value(v):
+    if v is None:
+        return 0.0
+    if isinstance(v, (bool, np.bool_)):
+        return float(int(v))
+    if isinstance(v, (int, float, np.number)):
+        return float(v)
+    if isinstance(v, (list, tuple, dict, set)):
+        return 0.0
+    if isinstance(v, str):
+        s = v.strip().lower()
+        mapping = {
+            "strong": 1.0, "weak": -1.0,
+            "high": 1.0, "normal": 0.0, "low": -1.0,
+            "stress": -1.0, "stable": 1.0,
+            "risk-off": -1.0, "risk-on": 1.0,
+            "bullish": 1.0, "bearish": -1.0, "neutral": 0.0,
+            "positive": 1.0, "negative": -1.0,
+        }
+        if s in mapping:
+            return mapping[s]
+        try:
+            if s.endswith("%"):
+                return float(s[:-1]) / 100.0
+            return float(s)
+        except Exception:
+            return 0.0
+    return 0.0
+
+def engineer_features(tkr, asset_closes, asset_highs, asset_lows, asset_volumes,
+                      indicator_closes, returns, macro_dict, arch_vol, regime_df):
+    price = asset_closes[tkr]
+    high  = asset_highs[tkr]
+    low   = asset_lows[tkr]
+    volu  = asset_volumes[tkr]
+
+    f = pd.DataFrame(index=price.index)
+
+    for p in [1,2,3,5,10,20,60,126]:
+        f[f"ret_{p}d"] = safe_pct_change(price, p)
+        f[f"mom_{p}d"] = price / price.shift(p) - 1
+
+    for w in [5,10,20,50,100,200]:
+        sma = price.rolling(w).mean()
+        f[f"sma_{w}"] = sma
+        f[f"px_sma_{w}"] = price / sma
+        f[f"sma_{w}_slope5"] = sma.diff(5)
+
+    for w in [7,14,21]:
+        d = price.diff()
+        gain = d.clip(lower=0).rolling(w).mean()
+        loss = (-d.clip(upper=0)).rolling(w).mean()
+        rs = gain / loss.replace(0,np.nan)
+        f[f"rsi_{w}"] = (100 - 100/(1+rs)).fillna(50)
+
+    tr = pd.concat([high-low,
+                    (high-price.shift(1)).abs(),
+                    (low-price.shift(1)).abs()],
+                   axis=1).max(axis=1)
+    f["atr_14"] = tr.rolling(14).mean()
+    f["atr_pct"] = f["atr_14"] / price
+
+    sma20 = price.rolling(20).mean()
+    std20 = price.rolling(20).std()
+    bb_u = sma20 + 2*std20
+    bb_l = sma20 - 2*std20
+    f["bb_pos"] = (price - bb_l) / (bb_u - bb_l)
+
+    f["vol_sma20"] = volu.rolling(20).mean()
+    f["vol_ratio"] = volu / f["vol_sma20"]
+    f["obv"] = (np.sign(price.diff()) * volu).fillna(0).cumsum()
+
+    f["arch_vol"] = arch_vol.reindex(f.index)
+    f = pd.concat([f, regime_df.reindex(f.index)], axis=1)
+
+    for k, v in macro_dict.items():
+        val = encode_macro_value(v)
+        f[f"macro_{k}"] = pd.Series(val, index=f.index)
+
+    if "^VIX" in indicator_closes:
+        vix = indicator_closes["^VIX"].reindex(f.index)
+        f["vix"] = vix
+        f["vix_chg_1d"] = safe_pct_change(vix, 1)
+
+    if "DX-Y.NYB" in indicator_closes:
+        dxy = indicator_closes["DX-Y.NYB"].reindex(f.index)
+        f["dxy"] = dxy
+        f["dxy_mom20"] = safe_pct_change(dxy, 20)
+
+    if "^TNX" in indicator_closes:
+        tnx = indicator_closes["^TNX"].reindex(f.index)
+        f["tnx"] = tnx
+        f["tnx_chg_5d"] = safe_pct_change(tnx, 5)
+
+    if tkr == "QQQ":
+        for semi in ["SOXX", "SMH"]:
+            if semi in indicator_closes:
+                s = indicator_closes[semi].reindex(f.index)
+                f["semis"] = s
+                f["semis_mom20"] = safe_pct_change(s, 20)
+                break
+        if "TLT" in indicator_closes:
+            tlt = indicator_closes["TLT"].reindex(f.index)
+            f["tlt_mom20"] = safe_pct_change(tlt, 20)
+
+    f = f.replace([np.inf,-np.inf], np.nan)
+    for col in f.columns:
+        f[col] = 0 if f[col].isna().all() else f[col].fillna(f[col].median())
+
+    return f
+
+# ----------------------------
+# 10) PCA FACTORS
+# ----------------------------
+def make_pca_factors(returns_df, n_components=2):
+    r = returns_df.dropna().copy()
+    r = r.apply(winsorize_series, axis=0)
+    r_std = (r - r.mean()) / r.std()
+    pca = PCA(n_components=n_components, random_state=SEED)
+    comps = pca.fit_transform(r_std.values)
+    comp_df = pd.DataFrame(
+        comps, index=r_std.index,
+        columns=[f"pc{i+1}" for i in range(n_components)]
+    )
+    return comp_df, pca
+
+# ----------------------------
+# 11) ML TRAINING
+# ----------------------------
+def time_series_train_best(X, y):
+    scaler = RobustScaler()
+    Xs = pd.DataFrame(scaler.fit_transform(X), index=X.index, columns=X.columns)
+
+    candidates = {
+        "LR": LogisticRegression(max_iter=2000, class_weight="balanced", random_state=SEED),
+        "RF": RandomForestClassifier(
+            n_estimators=400, max_depth=18, min_samples_split=10,
+            min_samples_leaf=5, max_features="sqrt",
+            class_weight="balanced", n_jobs=-1, random_state=SEED
+        ),
+        "GB": GradientBoostingClassifier(
+            n_estimators=300, max_depth=5, learning_rate=0.04,
+            subsample=0.8, random_state=SEED
+        ),
+        "XGB": xgb.XGBClassifier(
+            n_estimators=250, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric="logloss", random_state=SEED
+        )
+    }
+
+    models, scores = {}, {}
+    tscv = TimeSeriesSplit(n_splits=5)
+
+    for name, m in candidates.items():
+        fold_acc, ok = [], True
+        for tr_idx, te_idx in tscv.split(Xs):
+            try:
+                m.fit(Xs.iloc[tr_idx], y.iloc[tr_idx])
+                pred = m.predict(Xs.iloc[te_idx])
+                fold_acc.append(accuracy_score(y.iloc[te_idx], pred))
+            except Exception:
+                ok = False
+                break
+        if ok and fold_acc:
+            models[name] = m
+            scores[name] = float(np.mean(fold_acc))
+
+    if not models:
+        return None
+
+    if len(models) >= 3:
+        ens = VotingClassifier(
+            estimators=[(n, models[n]) for n in models],
+            voting="soft"
+        )
+        ens.fit(Xs, y)
+        models["ENS"] = ens
+        scores["ENS"] = max(scores.values()) + 1e-6
+
+    best_name = max(scores, key=scores.get)
+    return {"scaler": scaler, "best_model": models[best_name], "best_name": best_name, "cv_score": scores[best_name]}
+
+# ----------------------------
+# 12) RISK METRICS
+# ----------------------------
+def risk_metrics(returns_series):
+    r = returns_series.dropna()
+    if len(r) < 30:
+        return {}
+    mu, sig = r.mean(), r.std()
+    var_95 = np.quantile(r, 0.05)
+    cvar_95 = r[r <= var_95].mean()
+    sharpe = (mu / sig) * np.sqrt(252) if sig > 0 else 0
+    downside = r[r < 0].std()
+    sortino = (mu / downside) * np.sqrt(252) if downside > 0 else 0
+    gains = (r).clip(lower=0).sum()
+    losses = (-r).clip(lower=0).sum()
+    omega = gains / losses if losses > 0 else np.inf
+    return {
+        "mean": float(mu),
+        "vol": float(sig*np.sqrt(252)),
+        "VaR_95": float(var_95),
+        "CVaR_95": float(cvar_95),
+        "sharpe": float(sharpe),
+        "sortino": float(sortino),
+        "omega": float(omega),
+        "skew": float(r.skew()),
+        "kurtosis": float(r.kurt())
+    }
+
+# ----------------------------
+# 13) MONTE CARLO
+# ----------------------------
+def monte_carlo_forecast(price_series, vol_series, horizon_days=5, n_sims=5000,
+                         jump_prob=0.02, jump_mu=-0.01, jump_sigma=0.04, df_t=5):
+    px = price_series.dropna()
+    if len(px) < 60:
+        return None
+
+    r = np.log(px / px.shift(1)).dropna()
+    drift = r.mean()
+    vol = float(vol_series.dropna().iloc[-1])
+    s0 = float(px.iloc[-1])
+
+    sims = np.zeros((n_sims, horizon_days))
+    for i in range(n_sims):
+        s = s0
+        for t in range(horizon_days):
+            shock = stats.t.rvs(df_t) * vol
+            jump = np.random.normal(jump_mu, jump_sigma) if np.random.rand() < jump_prob else 0.0
+            s = s * np.exp(drift + shock + jump)
+            sims[i, t] = s
+
+    terminal = sims[:, -1]
+    exp_ret = float(np.mean(terminal / s0 - 1))
+    p_up = float(np.mean(terminal > s0))
+    conf = max(p_up, 1-p_up)
+
+    return {
+        "expected_return": exp_ret,
+        "prob_up": p_up,
+        "prob_down": 1-p_up,
+        "confidence": conf,
+        "terminal_dist": terminal
+    }
+
+# ----------------------------
+# 14) MACRO SCORECARDS
+# ----------------------------
+def macro_score_cards(macro, corr_matrix, current_regime_name, current_regime):
+    spy_factors = {
+        "Fed policy / rates": {
+            "status": f"10Y {macro.get('yield_10y',0):.2f}%",
+            "impact": "NEGATIVE" if macro.get("yield_10y",0) > 4.5 else "POSITIVE",
+            "reasoning": "Higher rates compress equity multiples"
+        },
+        "Inflation / surprises proxies": {
+            "status": f"Oil 3M mom {macro.get('oil_mom_3m',0):+.1%}",
+            "impact": "NEGATIVE" if macro.get("oil_mom_3m",0) > 0.10 else "NEUTRAL",
+            "reasoning": "Rising energy prices can re-ignite CPI/PCE risk"
+        },
+        "Growth / recession signals": {
+            "status": macro.get("recession_risk","Low"),
+            "impact": "NEGATIVE" if macro.get("recession_risk")=="High" else "POSITIVE",
+            "reasoning": "Recession risk damages forward EPS expectations"
+        },
+        "Credit conditions": {
+            "status": "STRESS" if macro.get("credit_stress",False) else "STABLE",
+            "impact": "NEGATIVE" if macro.get("credit_stress",False) else "POSITIVE",
+            "reasoning": "Tighter credit hurts equities"
+        },
+        "Liquidity / financial conditions": {
+            "status": macro.get("liquidity_proxy","Normal"),
+            "impact": "POSITIVE" if macro.get("liquidity_proxy")=="High" else "NEUTRAL",
+            "reasoning": "Easier conditions support risk assets"
+        },
+        "Risk appetite / volatility": {
+            "status": f"VIX {macro.get('vix_current',0):.0f}",
+            "impact": "NEGATIVE" if macro.get("vix_current",15)>25 else "POSITIVE",
+            "reasoning": "High vol suppresses flows"
+        },
+        "Market regime": {
+            "status": current_regime_name,
+            "impact": "POSITIVE" if current_regime==0 else ("NEUTRAL" if current_regime==1 else "NEGATIVE"),
+            "reasoning": "Regime tilt for broad equities"
+        }
+    }
+
+    qqq_factors = {
+        "Fed policy / real yields (duration)": {
+            "status": f"10Y {macro.get('yield_10y',0):.2f}%",
+            "impact": "NEGATIVE" if macro.get("yield_10y",0) > 4.0 else "POSITIVE",
+            "reasoning": "Tech is long-duration, sensitive to discount rates"
+        },
+        "Big Tech earnings / guidance proxy": {
+            "status": f"QQQ 6M mom {macro.get('qqq_mom_6m',0):+.1%}",
+            "impact": "POSITIVE" if macro.get("qqq_mom_6m",0) > 0 else "NEGATIVE",
+            "reasoning": "Momentum reflects forward EPS"
+        },
+        "Valuation vs yields regime": {
+            "status": f"Curve 5y-10y {macro.get('curve_5y10y',0):+.2f}",
+            "impact": "NEGATIVE" if macro.get("curve_5y10y",0) < -0.2 else "NEUTRAL",
+            "reasoning": "Inversion implies tighter regime for growth multiples"
+        },
+        "USD strength translation": {
+            "status": macro.get("dxy_strength","Weak"),
+            "impact": "NEGATIVE" if macro.get("dxy_strength")=="Strong" else "POSITIVE",
+            "reasoning": "Strong USD pressures multinational tech revenues"
+        },
+        "Semiconductor cycle / hardware demand": {
+            "status": f"Semis 3M mom {macro.get('semis_mom_3m',0):+.1%}",
+            "impact": "POSITIVE" if macro.get("semis_mom_3m",0) > 0 else "NEGATIVE",
+            "reasoning": "Semis are NASDAQ lead indicator"
+        },
+        "Credit / liquidity (growth funding)": {
+            "status": "STRESS" if macro.get("credit_stress",False) else "STABLE",
+            "impact": "NEGATIVE" if macro.get("credit_stress",False) else "POSITIVE",
+            "reasoning": "Tighter spreads hurt growth rotation"
+        },
+        "Risk-on / risk-off flows": {
+            "status": current_regime_name,
+            "impact": "POSITIVE" if current_regime==0 else "NEGATIVE",
+            "reasoning": "QQQ thrives in bull/low-vol regimes"
+        }
+    }
+
+    return spy_factors, qqq_factors
+
+def composite_score(factors):
+    return sum(
+        1 if f["impact"] in ["POSITIVE","BULLISH"] else
+        -1 if f["impact"] in ["NEGATIVE","BEARISH"] else 0
+        for f in factors.values()
+    )
+
+# ----------------------------
+# 15) ULTRA-SAFE CSV WRITER (no pandas internal formatter)
+# ----------------------------
+def safe_to_csv(df: pd.DataFrame, path: str):
+    """
+    Bypass pandas to_csv entirely to avoid:
+    AttributeError: Index has no _format_native_types
+    """
+    df2 = df.copy()
+
+    # force plain strings everywhere
+    df2.columns = [str(c) for c in df2.columns]
+    df2.index   = [str(i) for i in df2.index]
+
+    # write via stdlib csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["index"] + df2.columns)
+        for idx, row in df2.iterrows():
+            w.writerow([idx] + [row[c] for c in df2.columns])
+
+# ----------------------------
+# 16) MAIN PIPELINE
+# ----------------------------
+def run_system():
+    print("="*80)
+    print("SPX + NASDAQ MACRO-QUANT SYSTEM V1 (COLAB-NATIVE)")
+    print("="*80)
+
+    asset_data, indicator_data = collect_market_data()
+    asset_closes, asset_opens, asset_highs, asset_lows, asset_volumes = extract_ohlcv(asset_data)
+    indicator_closes, *_ = extract_ohlcv(indicator_data)
+
+    all_closes = pd.concat([asset_closes, indicator_closes], axis=1).ffill(limit=5).dropna()
+    returns = all_closes.pct_change().dropna()
+
+    targets = make_targets(asset_closes)
+
+    arch_vols, regimes = {}, {}
+    for tkr in ASSETS:
+        arch_vols[tkr] = fit_best_vol_model(returns[tkr])["vol"]
+        regimes[tkr] = fit_markov_regime(returns[tkr], k=3)
+
+    global_regime = regimes["SPY"]
+    current_regime = int(global_regime["regime_current"].dropna().iloc[-1])
+    regime_names = {0:"Low Vol (Bull)",1:"Normal",2:"High Vol (Bear)"}
+    current_regime_name = regime_names.get(current_regime,"Unknown")
+
+    macro = build_macro_indicators(asset_closes, indicator_closes)
+
+    asset_rets = returns[list(ASSETS.keys())]
+    pca_factors, _ = make_pca_factors(asset_rets, n_components=2)
+
+    features = {}
+    for tkr in ASSETS:
+        f = engineer_features(
+            tkr, asset_closes, asset_highs, asset_lows, asset_volumes,
+            indicator_closes, returns, macro, arch_vols[tkr], global_regime
+        )
+        f = pd.concat([f, pca_factors.reindex(f.index)], axis=1)
+        features[tkr] = f
+
+    models, forward_preds = {}, {}
+    for tkr in ASSETS:
+        X = features[tkr]
+        y = targets[tkr]["5d_binary"]
+        data = pd.concat([X, y.rename("target")], axis=1).dropna(subset=["target"])
+
+        if len(data) < 350:
+            print(f"[WARN] {tkr} insufficient ML samples ({len(data)})")
+            continue
+
+        Xc, yc = data.drop("target", axis=1), data["target"]
+        mdl = time_series_train_best(Xc, yc)
+        if mdl is None:
+            print(f"[WARN] {tkr} ML failed")
+            continue
+
+        models[tkr] = mdl
+        latest = Xc.iloc[-1:]
+        latest_scaled = mdl["scaler"].transform(latest)
+        pred_class = int(mdl["best_model"].predict(latest_scaled)[0])
+        pred_proba = mdl["best_model"].predict_proba(latest_scaled)[0]
+        conf = float(pred_proba.max())
+
+        forward_preds[tkr] = {
+            "prediction_class": pred_class,
+            "prediction_direction": "UP" if pred_class==1 else "DOWN/FLAT",
+            "confidence": conf,
+            "prob_up": float(pred_proba[1]),
+            "prob_down": float(pred_proba[0]),
+            "model_used": mdl["best_name"],
+            "cv_score": mdl["cv_score"],
+            "current_price": float(asset_closes[tkr].iloc[-1])
+        }
+
+    mc_forecasts = {
+        tkr: monte_carlo_forecast(asset_closes[tkr], arch_vols[tkr], horizon_days=5, n_sims=5000)
+        for tkr in ASSETS
+    }
+
+    risk = {tkr: risk_metrics(returns[tkr]) for tkr in ASSETS}
+
+    corr_matrix = asset_rets.tail(60).corr()
+    spy_f, qqq_f = macro_score_cards(macro, corr_matrix, current_regime_name, current_regime)
+
+    scores = {
+        "SPY": composite_score(spy_f),
+        "QQQ": composite_score(qqq_f)
+    }
+
+    combined = {}
+    for tkr in ASSETS:
+        macro_rating = "BULLISH" if scores.get(tkr,0) > 1 else ("BEARISH" if scores.get(tkr,0) < -1 else "NEUTRAL")
+        ml = forward_preds.get(tkr, {})
+        mc = mc_forecasts.get(tkr, {})
+
+        ml_dir = ml.get("prediction_direction","N/A")
+        mc_dir = "UP" if (mc and mc["prob_up"] > 0.55) else "DOWN/FLAT"
+
+        if macro_rating=="BULLISH" and ml_dir=="UP" and mc_dir=="UP" and ml.get("confidence",0)>0.65:
+            combined[tkr] = "🟢 STRONG BUY"
+        elif macro_rating=="BEARISH" and ml_dir!="UP" and mc_dir!="UP" and ml.get("confidence",0)>0.65:
+            combined[tkr] = "🔴 STRONG SELL"
+        elif macro_rating=="BULLISH" or ml_dir=="UP":
+            combined[tkr] = "🟢 MODERATE BUY"
+        elif macro_rating=="BEARISH" or ml_dir!="UP":
+            combined[tkr] = "🔴 MODERATE SELL"
+        else:
+            combined[tkr] = "🟡 HOLD"
+
+    print("\n" + "="*80)
+    print("MACRO SUMMARY")
+    print("="*80)
+    print("Global Regime:", current_regime_name)
+    print("Macro snapshot:", {k: macro[k] for k in macro})
+
+    print("\n" + "="*80)
+    print("SPY MACRO SCORECARD")
+    print("="*80)
+    for k,v in spy_f.items():
+        print(f"\n{k}\n  Status: {v['status']}\n  Impact: {v['impact']}\n  Reason: {v['reasoning']}")
+
+    print("\n" + "="*80)
+    print("QQQ MACRO SCORECARD")
+    print("="*80)
+    for k,v in qqq_f.items():
+        print(f"\n{k}\n  Status: {v['status']}\n  Impact: {v['impact']}\n  Reason: {v['reasoning']}")
+
+    print("\n" + "="*80)
+    print("ASSET SIGNALS (5D HORIZON)")
+    print("="*80)
+    for tkr in ASSETS:
+        ml = forward_preds.get(tkr,{})
+        mc = mc_forecasts.get(tkr,{})
+        print(f"\n{tkr} ({ASSETS[tkr]})")
+        print(f"  Price: ${ml.get('current_price', np.nan):.2f}")
+        print(f"  Macro Score: {scores.get(tkr,0):+d}")
+        print(f"  ML Direction: {ml.get('prediction_direction','N/A')}  Conf: {ml.get('confidence',0):.1%}  Model: {ml.get('model_used','N/A')}")
+        if mc:
+            print(f"  MC Prob Up: {mc['prob_up']:.1%}  ExpRet(5d): {mc['expected_return']:.2%}")
+        print(f"  Combined Signal: {combined.get(tkr)}")
+        print(f"  Risk: Sharpe {risk[tkr].get('sharpe',0):.2f}, VaR95 {risk[tkr].get('VaR_95',0):.2%}")
+
+    # Save artifacts (ULTRA SAFE)
+    pred_df  = pd.DataFrame(forward_preds).T
+    score_df = pd.DataFrame(scores, index=["macro_score"]).T
+    risk_df  = pd.DataFrame(risk).T
+    comb_df  = pd.DataFrame(combined, index=["combined_signal"]).T
+
+    safe_to_csv(pred_df,  "forward_predictions_5d.csv")
+    safe_to_csv(score_df, "macro_scores.csv")
+    safe_to_csv(risk_df,  "risk_metrics.csv")
+    safe_to_csv(comb_df,  "combined_signals.csv")
+
+    print("\n✅ Files saved:")
+    print("  - forward_predictions_5d.csv")
+    print("  - macro_scores.csv")
+    print("  - risk_metrics.csv")
+    print("  - combined_signals.csv")
+    print("\n⚠️ Educational use only.")
+
+run_system()
