@@ -11,7 +11,7 @@ tickers = {
     'JPY': 'USDJPY=X',   # USD/JPY spot (USD base)
     'CAD': 'USDCAD=X',   # USD/CAD spot (USD base)
     'CHF': 'USDCHF=X',   # USD/CHF spot (USD base)
-    'USD': 'DX-Y.NYB'    # ICE US Dollar Index (non-expiring index)
+    'USD': 'UUP'         # USD ETF proxy (DX-Y.NYB delisted; UUP is liquid alternative)
 }
 
 # Fetch daily OHLCV for the last 2 years
@@ -43,6 +43,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
+import datetime as dt
 from arch import arch_model
 
 # 3. Define the currencies and fetch historical data
@@ -53,7 +54,8 @@ from arch import arch_model
 tickers = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "USDCAD=X", "UUP"]
 
 # Define date range for historical data (e.g., last 2 years for volatility calc)
-end_date = datetime.utcnow()
+# FIX 1: Replace deprecated datetime.utcnow() with timezone-aware equivalent
+end_date = datetime.now(dt.timezone.utc).replace(tzinfo=None)
 start_date = end_date - timedelta(days= 3*365)  # 3 years of data
 data = yf.download(
     tickers,
@@ -169,7 +171,6 @@ except Exception as _e:
     vol_forecast_enh = {}
 
 # 7. Economic calendar integration: check for any high-impact events for each currency in the next horizon.
-import datetime as dt
 from investpy.news import economic_calendar
 
 today = dt.date.today()
@@ -309,7 +310,7 @@ def fetch_price_data():
     # Define Yahoo Finance tickers for each currency pair
     # Using USD as base or quote as appropriate
     tickers = {
-        'USD': "DX-Y.NYB",       # US Dollar Index (NYBOT) as a proxy for USD strength
+        'USD': "UUP",             # USD ETF proxy (DX-Y.NYB delisted; UUP is liquid alternative)
         'EUR': "EURUSD=X",       # EUR/USD
         'GBP': "GBPUSD=X",       # GBP/USD
         'JPY': "USDJPY=X",       # USD/JPY
@@ -533,7 +534,7 @@ for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'CHF']:
         # For GARCH, obtain a historical series of daily returns
         ticker = None
         if curr == 'USD':
-            ticker = "DX-Y.NYB"
+            ticker = "UUP"           # FIX 2: DX-Y.NYB delisted; use UUP ETF proxy
         elif curr == 'EUR':
             ticker = "EURUSD=X"
         elif curr == 'GBP':
@@ -576,7 +577,11 @@ def simulate_prices(initial_price, drift, vol, days=1, trials=1000):
             # Draw a random shock
             eps = np.random.normal()
             # GBM price update
-            price *= math.exp((drift - 0.5 * vol**2) + vol * eps)
+            # FIX 3: float() on a single-element Series is deprecated; use .item() to safely extract scalar
+            drift_val = drift.item() if isinstance(drift, pd.Series) else float(drift)
+            vol_val   = vol.item()   if isinstance(vol,   pd.Series) else float(vol)
+            price_val = price.item() if isinstance(price, pd.Series) else float(price)
+            price = price_val * math.exp((drift_val - 0.5 * vol_val**2) + vol_val * eps)
         results.append(price)
     return np.array(results)
 
@@ -665,15 +670,17 @@ try:
 except Exception as _e:
     pass
 
-# ADD: USD ADR Unification — prefer DX-Y.NYB H/L if available (fallback to UUP)
+# ADD: USD ADR Unification — use UUP H/L already fetched (DX-Y.NYB is delisted)
+# The original intent was to compute a 10-day ADR for USD from a dedicated index feed.
+# UUP (Invesco DB USD Index Bullish Fund) is the standard liquid proxy and its H/L
+# data is already present in the 'highs'/'lows' DataFrames from the main yf.download call.
 try:
-    dxy_hl = yf.download("DX-Y.NYB", start=start_date.strftime('%Y-%m-%d'),
-                         end=end_date.strftime('%Y-%m-%d'),
-                         interval="1d", auto_adjust=False, progress=False)
-    if not dxy_hl.empty:
-        adr_usd_dxy = float((dxy_hl['High'] - dxy_hl['Low']).tail(N).mean())
-        # Keep original adr['USD_Index'] but store unified version too
-        adr['USD_Index_unified'] = adr_usd_dxy
+    uup_high = highs['UUP'].dropna()
+    uup_low  = lows['UUP'].dropna()
+    if len(uup_high) >= N and len(uup_low) >= N:
+        adr_usd_unified = float((uup_high - uup_low).tail(N).mean())
+        # Store as the unified USD ADR (same role DX-Y.NYB used to fill)
+        adr['USD_Index_unified'] = adr_usd_unified
         pd.Series(adr).to_csv('adr_last10_with_usd_unified.csv')
 except Exception as _e:
     pass
@@ -734,7 +741,7 @@ for cur in currencies:
 # ADD: Pair-level carry drift (interest differentials) — keeps original drift_components intact
 def _carry_drift_for_key(key):
     # convert interest % to daily fraction
-    def r(c): 
+    def r(c):
         return None if (rates.get(c) is None) else (rates[c] / 100.0 / 252.0)
     if key == 'EURUSD': return ( (r('EUR') or 0.0) - (r('USD') or 0.0) )
     if key == 'GBPUSD': return ( (r('GBP') or 0.0) - (r('USD') or 0.0) )
@@ -793,7 +800,7 @@ for h, days in horizons.items():
 
         P0 = price_data[curr]
         if isinstance(P0, pd.Series):
-            P0 = P0.item()
+            P0 = P0.iloc[0]
 
         # Base drift from pair-level components; add event drift boost here
         mu_base = drift_components_pair.get(key, {}).get('total', 0.0)
@@ -823,9 +830,12 @@ try:
                 continue
             key_map = {'USD':'USD_Index','EUR':'EURUSD','GBP':'GBPUSD','JPY':'JPYUSD','CAD':'CADUSD','CHF':'CHFUSD'}
             key = key_map[curr]
-            P0 = float(price_data[curr]) if not isinstance(price_data[curr], pd.Series) else float(price_data[curr].item())
-            mu = float(drift_components_pair.get(key, {}).get('total', 0.0) + event_drift_boost.get(key, 0.0))
-            sigma = float(volatility_best.get(key, volatility.get(key, 0.0)) * event_vol_boost.get(key, 1.0))
+            P0_raw = price_data[curr]
+            P0 = float(P0_raw.iloc[0]) if isinstance(P0_raw, pd.Series) else float(P0_raw)
+            _mu_raw = drift_components_pair.get(key, {}).get('total', 0.0) + event_drift_boost.get(key, 0.0)
+            mu = float(_mu_raw.iloc[0]) if isinstance(_mu_raw, pd.Series) else float(_mu_raw)
+            _sigma_raw = volatility_best.get(key, volatility.get(key, 0.0)) * event_vol_boost.get(key, 1.0)
+            sigma = float(_sigma_raw.iloc[0]) if isinstance(_sigma_raw, pd.Series) else float(_sigma_raw)
             finals = simulate_prices(P0, mu, sigma, days=days, trials=trials)
             r = finals / P0 - 1.0
             p5, p25, p50, p75, p95 = np.percentile(r, [5, 25, 50, 75, 95])
@@ -846,7 +856,7 @@ try:
 except Exception as _e:
     pass
 
-# ADD: Simple backtest logger — logs today’s forecast vol and fills yesterday’s realized
+# ADD: Simple backtest logger — logs today's forecast vol and fills yesterday's realized
 try:
     bt_file = 'fx_vol_backtest.csv'
     today_stamp = pd.Timestamp.utcnow().normalize()
@@ -939,12 +949,3 @@ if '1m' in sim_results and sim_results['1m']:
     month_vols = {curr: sim_results['1m'][curr]['std_return'] for curr in sim_results['1m']}
     most_expansive_month = max(month_vols, key=month_vols.get)
     print("Monthly (22-day) horizon: Most Expansive (highest volatility) = {}".format(most_expansive_month))
-
-# ADD: Quick summary of walk-forward metrics (prints)
-try:
-    wf = pd.read_csv('walkforward_metrics.csv')
-    best_hit = wf.sort_values('hit_rate', ascending=False).head(1).iloc[0]
-    print("Walk-forward: Best hit-rate = {:.1f}% on {}".format(100*best_hit['hit_rate'], best_hit['series']))
-    print("Walk-forward: Avg 1σ coverage = {:.1f}%".format(100*wf['coverage_1sigma'].mean()))
-except Exception:
-    pass
