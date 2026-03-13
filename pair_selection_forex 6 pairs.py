@@ -69,8 +69,12 @@ data = yf.download(
 # We'll use the 'Close' prices for analysis (for currencies, Adj Close == Close as there's no corporate action).
 closes = data['Close'].copy()
 
-# Drop any rows with missing values (e.g., holidays)
-closes.dropna(inplace=True)
+# Forward-fill up to 1 day for UUP (ETF) which has US-only trading holidays
+# then only require the core FX pairs to be non-null (UUP gaps are tolerable)
+closes.ffill(limit=1, inplace=True)
+core_fx = ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'USDCHF=X', 'USDCAD=X']
+available_core = [c for c in core_fx if c in closes.columns]
+closes.dropna(subset=available_core, inplace=True)
 
 # ADD: Business-day alignment & NaN hygiene (non-destructive; creates new frames)
 try:
@@ -328,17 +332,24 @@ def fetch_price_data():
             continue
         if hist.empty:
             continue
-        # Use the last available close price
-        last_price = hist['Close'].iloc[-1]
+        # Squeeze to 1-D Series — yfinance may return a single-column DataFrame for one ticker
+        close_s = hist['Close']
+        if isinstance(close_s, pd.DataFrame):
+            close_s = close_s.squeeze()
+        # Use the last available close price as a plain scalar
+        last_price = float(close_s.iloc[-1])
         price_data[curr] = last_price
 
-        # Compute 5-day average return (momentum)
-        rets = hist['Close'].pct_change().dropna()
+        # Compute 5-day average return (momentum) — squeeze ensures pct_change gives a Series
+        rets = close_s.pct_change().dropna()
         if len(rets) >= 5:
             last5 = rets.iloc[-5:]
             avg_return = last5.mean()
         else:
             avg_return = rets.mean()
+        # Force to plain float — .mean() on a Series returns a scalar, but squeeze() may leave
+        # a named Series element in edge cases with some yfinance versions
+        avg_return = float(avg_return) if not isinstance(avg_return, float) else avg_return
         # Adjust sign for currencies where USD is base (reverse relationship)
         if curr in ['JPY', 'CAD', 'CHF']:
             # For USD/JPY, USD/CAD, USD/CHF: if pair rose, USD strengthened, so opposite for JPY,CAD,CHF
@@ -492,11 +503,20 @@ except Exception:
 avg_rate = np.mean([r for r in rates.values() if r is not None]) if rates else 0
 
 drift_components = {}
+# volatility keyed by PAIR name (e.g. 'EURUSD', 'USD_Index') to match downstream lookups
+# in volatility_best consolidation and sim_results blocks.
 volatility = {}
 
+# Map 3-letter currency code -> pair key and yfinance ticker
+_curr_to_pair   = {'USD':'USD_Index','EUR':'EURUSD','GBP':'GBPUSD','JPY':'JPYUSD','CAD':'CADUSD','CHF':'CHFUSD'}
+_curr_to_ticker = {'USD':'UUP','EUR':'EURUSD=X','GBP':'GBPUSD=X','JPY':'USDJPY=X','CAD':'USDCAD=X','CHF':'USDCHF=X'}
+
 for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'CHF']:
-    # Momentum component (as daily fraction)
-    mom = momentum.get(curr, 0.0)
+    pair_key = _curr_to_pair[curr]
+
+    # Momentum: force to plain Python float so all arithmetic stays scalar
+    _mom_raw = momentum.get(curr, 0.0)
+    mom = float(_mom_raw.iloc[0]) if isinstance(_mom_raw, pd.Series) else float(_mom_raw)
 
     # Sentiment component (scale the VADER compound score)
     sent = sentiments.get(curr, 0.0)
@@ -515,7 +535,7 @@ for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'CHF']:
     # Event drift boost (e.g., if an event keyword found in news, add a small bias)
     event_drift = 0.0
 
-    # Total drift for the currency
+    # Total drift for the currency -- all components are plain floats
     total_drift = mom + sentiment_drift + macro_drift + event_drift
 
     drift_components[curr] = {
@@ -530,58 +550,50 @@ for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'CHF']:
     # We use the last 60 days of data for a decent volatility estimate (if available)
     hist_days = 60
     vol = None
+    retns_local = None  # explicit local var; avoids cross-iteration leakage
     try:
-        # For GARCH, obtain a historical series of daily returns
-        ticker = None
-        if curr == 'USD':
-            ticker = "UUP"           # FIX 2: DX-Y.NYB delisted; use UUP ETF proxy
-        elif curr == 'EUR':
-            ticker = "EURUSD=X"
-        elif curr == 'GBP':
-            ticker = "GBPUSD=X"
-        elif curr == 'JPY':
-            ticker = "USDJPY=X"
-        elif curr == 'CAD':
-            ticker = "USDCAD=X"
-        elif curr == 'CHF':
-            ticker = "USDCHF=X"
-        if ticker:
-            hist = yf.download(ticker, period=f"{hist_days}d", interval="1d", auto_adjust=False, progress=False)
-            retns = hist['Close'].pct_change().dropna()
-            # Adjust sign for reverse pairs as before
-            if curr in ['JPY', 'CAD', 'CHF']:
-                retns = -retns
-            if not retns.empty:
-                # Fit GARCH(1,1)
-                am = arch_model(retns * 100, p=1, q=1, rescale=False)
-                res = am.fit(disp='off')
-                # Forecast volatility for the next day
-                forecast = res.forecast(horizon=1)
-                var_forecast = forecast.variance.iloc[-1, 0]
-                vol = np.sqrt(var_forecast) / 100.0  # convert back to fraction (since we scaled returns by 100)
+        ticker = _curr_to_ticker[curr]
+        hist = yf.download(ticker, period=f"{hist_days}d", interval="1d", auto_adjust=False, progress=False)
+        # Squeeze multi-index column if yfinance returns a DataFrame for single ticker
+        close_col = hist['Close']
+        if isinstance(close_col, pd.DataFrame):
+            close_col = close_col.squeeze()
+        retns_local = close_col.pct_change().dropna()
+        # Adjust sign for reverse pairs (USD is base, so rising price = weaker foreign ccy)
+        if curr in ['JPY', 'CAD', 'CHF']:
+            retns_local = -retns_local
+        if not retns_local.empty:
+            # Fit GARCH(1,1)
+            am = arch_model(retns_local * 100, p=1, q=1, rescale=False)
+            res = am.fit(disp='off')
+            # Forecast volatility for the next day
+            forecast = res.forecast(horizon=1)
+            var_forecast = forecast.variance.iloc[-1, 0]
+            vol = float(np.sqrt(var_forecast) / 100.0)  # convert back to fraction
     except Exception as e:
         print(f"GARCH model failed for {curr}: {e}")
     if vol is None:
-        # Fallback: use sample std dev of *local* returns (not global)
-        vol = retns.std() if 'retns' in locals() else 0.0
-    volatility[curr] = vol
+        # Fallback: sample std dev of this currency's own returns only (no cross-iteration leak)
+        vol = float(retns_local.std()) if retns_local is not None and not retns_local.empty else 0.0
+    # KEY BY PAIR NAME so volatility_best and sim_results lookups resolve correctly
+    volatility[pair_key] = vol
 
-    import math
+import math  # module-level import (was incorrectly inside the for-loop body)
 
 def simulate_prices(initial_price, drift, vol, days=1, trials=1000):
     """Simulate price paths for given days and trials using GBM with constant drift and vol."""
+    # Coerce all inputs to plain Python floats once at entry — upstream callers may pass
+    # a single-element pd.Series (yfinance multi-ticker returns) which would cause a
+    # FutureWarning (and eventual TypeError) if passed to math.exp inside the loop.
+    drift_val = float(drift.iloc[0]) if isinstance(drift, pd.Series) else float(drift)
+    vol_val   = float(vol.iloc[0])   if isinstance(vol,   pd.Series) else float(vol)
+    p0        = float(initial_price.iloc[0]) if isinstance(initial_price, pd.Series) else float(initial_price)
     results = []
     for _ in range(trials):
-        price = initial_price
-        for t in range(days):
-            # Draw a random shock
+        price = p0
+        for _ in range(days):
             eps = np.random.normal()
-            # GBM price update
-            # FIX 3: float() on a single-element Series is deprecated; use .item() to safely extract scalar
-            drift_val = drift.item() if isinstance(drift, pd.Series) else float(drift)
-            vol_val   = vol.item()   if isinstance(vol,   pd.Series) else float(vol)
-            price_val = price.item() if isinstance(price, pd.Series) else float(price)
-            price = price_val * math.exp((drift_val - 0.5 * vol_val**2) + vol_val * eps)
+            price = price * math.exp((drift_val - 0.5 * vol_val**2) + vol_val * eps)
         results.append(price)
     return np.array(results)
 
@@ -757,12 +769,14 @@ def _carry_drift_for_key(key):
     return 0.0
 
 drift_components_pair = {}
+_pair_to_curr = {'EURUSD':'EUR','GBPUSD':'GBP','JPYUSD':'JPY','CADUSD':'CAD','CHFUSD':'CHF','USD_Index':'USD'}
 for key in currencies:
-    mom = momentum.get(key.replace('USD','').replace('Index','').strip(), 0.0) if key in ['USD_Index'] else momentum.get(key.split('USD')[0], 0.0)
-    # Momentum already computed per currency symbol block; keep original approach for consistency:
-    mom = momentum.get({'EURUSD':'EUR','GBPUSD':'GBP','JPYUSD':'JPY','CADUSD':'CAD','CHFUSD':'CHF','USD_Index':'USD'}[key], 0.0)
-    sent = sentiments.get({'EURUSD':'EUR','GBPUSD':'GBP','JPYUSD':'JPY','CADUSD':'CAD','CHFUSD':'CHF','USD_Index':'USD'}[key], 0.0) * 0.002
-    carry = _carry_drift_for_key(key)
+    # Force momentum to a plain Python float — yfinance can return a single-column Series
+    _mom_raw = momentum.get(_pair_to_curr[key], 0.0)
+    mom  = float(_mom_raw.iloc[0]) if isinstance(_mom_raw, pd.Series) else float(_mom_raw)
+    sent = float(sentiments.get(_pair_to_curr[key], 0.0)) * 0.002
+    carry = float(_carry_drift_for_key(key))
+    # total is now guaranteed to be a plain float — no Series leaking into simulate_prices
     drift_components_pair[key] = {
         'momentum': mom,
         'sentiment': sent,
@@ -790,6 +804,7 @@ if ff_cal is not None and not ff_cal.empty:
                 event_drift_boost[impacted_key] = event_drift_boost.get(impacted_key, 0.0) + 0.001
 
 # Store simulation outcomes (APPLY event boosts + best vol + pair-level carry)
+np.random.seed(42)  # seed for reproducibility (matches sim_results_plus below)
 sim_results = {h: {} for h in horizons}
 for h, days in horizons.items():
     for curr in ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'CHF']:
