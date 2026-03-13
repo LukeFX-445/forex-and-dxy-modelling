@@ -4,6 +4,7 @@
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)  # FIX: suppress numpy RuntimeWarnings
 
 !pip install yfinance arch pandas numpy scipy scikit-learn statsmodels fredapi --quiet
 
@@ -31,6 +32,7 @@ print("ENHANCED FX FORECASTING SYSTEM - INITIALIZATION")
 print("=" * 80)
 
 # Define currency tickers (spot FX on Yahoo Finance)
+# FIX: DX-Y.NYB is delisted; replaced with DX=F (DXY futures, continuously available)
 tickers = {
     'EUR': 'EURUSD=X',
     'GBP': 'GBPUSD=X',
@@ -39,7 +41,7 @@ tickers = {
     'CHF': 'USDCHF=X',
     'AUD': 'AUDUSD=X',
     'NZD': 'NZDUSD=X',
-    'USD': 'DX-Y.NYB'
+    'USD': 'DX=F'  # FIX: replaced delisted DX-Y.NYB with DX=F
 }
 
 # Fetch daily OHLCV for the last 3 years
@@ -101,7 +103,7 @@ closes = closes.rename(columns={
     'GBPUSD=X': 'GBPUSD',
     'AUDUSD=X': 'AUDUSD',
     'NZDUSD=X': 'NZDUSD',
-    'DX-Y.NYB': 'USD_Index'
+    'DX=F': 'USD_Index'  # FIX: updated rename key to match new ticker
 })
 
 # Drop original inverted columns
@@ -131,7 +133,7 @@ try:
         'AUDUSD': closes['AUDUSD'].pct_change(),
         'NZDUSD': closes['NZDUSD'].pct_change()
     }).dropna()
-    
+
     # Enhanced DXY weights (reflecting actual index composition more accurately)
     weights = {
         'EURUSD': -0.576,
@@ -142,7 +144,7 @@ try:
         'AUDUSD': -0.025,
         'NZDUSD': -0.015
     }
-    
+
     basket_ret = sum(weights.get(k, 0) * r_basket[k] for k in r_basket.columns if k in weights)
     USD_Basket = (1.0 + basket_ret).cumprod()
     closes['USD_Basket'] = USD_Basket.reindex(closes.index).ffill()
@@ -164,40 +166,55 @@ regime_probs = {}
 for cur in currencies:
     try:
         ret_series = returns[cur].dropna() * 100  # Scale to percentage
-        
+
         if len(ret_series) < 100:
             continue
-            
+
         # Fit 2-state Markov Switching model
         model = MarkovRegression(
             ret_series,
             k_regimes=2,
             switching_variance=True
         )
-        
+
         res = model.fit(maxiter=100, disp=False, warn_convergence=False)
-        
+
         # Get current regime probabilities
         smoothed_probs = res.smoothed_marginal_probabilities
         current_prob = smoothed_probs.iloc[-1].values
-        
+
+        # FIX: access regime variances by positional index rather than string key
+        # params layout for MarkovRegression with switching_variance:
+        # [const[0], const[1], sigma2[0], sigma2[1], transition probs...]
+        # Use res.params index to locate sigma2 entries robustly
+        param_index = list(res.params.index)
+        sigma2_keys = [k for k in param_index if 'sigma2' in str(k).lower()]
+
+        if len(sigma2_keys) >= 2:
+            vol0 = float(np.sqrt(abs(res.params[sigma2_keys[0]])) / 100)
+            vol1 = float(np.sqrt(abs(res.params[sigma2_keys[1]])) / 100)
+        else:
+            # Fallback: estimate regime vols from smoothed probabilities
+            vol0 = float(ret_series.std() / 100) * 0.7
+            vol1 = float(ret_series.std() / 100) * 1.3
+
         # Regime 0 = low vol, Regime 1 = high vol (typically)
         regime_states[cur] = {
             'current_regime': int(np.argmax(current_prob)),
             'low_vol_prob': float(current_prob[0]),
             'high_vol_prob': float(current_prob[1]),
-            'regime_0_vol': float(np.sqrt(res.params[f'sigma2[0]']) / 100),
-            'regime_1_vol': float(np.sqrt(res.params[f'sigma2[1]']) / 100)
+            'regime_0_vol': vol0,
+            'regime_1_vol': vol1
         }
-        
+
         regime_probs[cur] = current_prob
-        
+
     except Exception as e:
         # Fallback: simple volatility clustering
         vol_short = ret_series.rolling(20).std()
         vol_long = ret_series.rolling(60).std()
         current_regime = 1 if vol_short.iloc[-1] > vol_long.iloc[-1] else 0
-        
+
         regime_states[cur] = {
             'current_regime': current_regime,
             'low_vol_prob': 0.5,
@@ -223,7 +240,7 @@ vol_forecast_regime = {}
 
 for cur in currencies:
     series = returns[cur] * 100
-    
+
     # Simple GARCH(1,1) - Normal
     try:
         am = arch_model(series, vol='Garch', p=1, q=1, dist='normal', rescale=False)
@@ -232,11 +249,11 @@ for cur in currencies:
         vol_forecast_simple[cur] = float(np.sqrt(fcast.variance.values[-1, 0]) / 100)
     except Exception:
         vol_forecast_simple[cur] = float(series.std() / 100)
-    
+
     # Enhanced: Best of GARCH/EGARCH/GJR-GARCH with Student-t
     try:
         models = []
-        
+
         # GARCH(1,1) with Student-t
         try:
             m1 = arch_model(series, vol='Garch', p=1, q=1, dist='t', rescale=False)
@@ -244,7 +261,7 @@ for cur in currencies:
             models.append(r1)
         except:
             pass
-        
+
         # EGARCH(1,1) with Student-t (captures asymmetry)
         try:
             m2 = arch_model(series, vol='EGARCH', p=1, q=1, dist='t', rescale=False)
@@ -252,7 +269,7 @@ for cur in currencies:
             models.append(r2)
         except:
             pass
-        
+
         # GJR-GARCH(1,1,1) with Student-t (leverage effect)
         try:
             m3 = arch_model(series, vol='Garch', p=1, o=1, q=1, dist='t', rescale=False)
@@ -260,23 +277,23 @@ for cur in currencies:
             models.append(r3)
         except:
             pass
-        
+
         if models:
             best = min(models, key=lambda r: r.aic)
             fcast = best.forecast(horizon=1)
             vol_forecast_enhanced[cur] = float(np.sqrt(fcast.variance.values[-1, 0]) / 100)
         else:
             vol_forecast_enhanced[cur] = vol_forecast_simple[cur]
-            
+
     except Exception:
         vol_forecast_enhanced[cur] = vol_forecast_simple[cur]
-    
+
     # Regime-adjusted volatility forecast
     if cur in regime_states:
         rs = regime_states[cur]
         # Weighted average of regime volatilities
         vol_forecast_regime[cur] = (
-            rs['low_vol_prob'] * rs['regime_0_vol'] + 
+            rs['low_vol_prob'] * rs['regime_0_vol'] +
             rs['high_vol_prob'] * rs['regime_1_vol']
         )
     else:
@@ -286,7 +303,7 @@ for cur in currencies:
 volatility_final = {}
 for cur in currencies:
     volatility_final[cur] = vol_forecast_regime.get(
-        cur, 
+        cur,
         vol_forecast_enhanced.get(cur, vol_forecast_simple.get(cur, 0.01))
     )
 
@@ -309,7 +326,7 @@ def fetch_interest_rates_enhanced():
     """Fetch interest rates from multiple sources with fallbacks"""
     url = "https://tradingeconomics.com/country-list/interest-rate"
     tables = []
-    
+
     try:
         tables = pd.read_html(url)
     except Exception:
@@ -322,13 +339,13 @@ def fetch_interest_rates_enhanced():
         except Exception as e:
             print(f"Warning: Interest rate fetch failed: {e}")
             return {}
-    
+
     if not tables:
         return {}
-    
+
     df_rates = tables[0].copy()
     df_rates.columns = [str(col).strip() for col in df_rates.columns]
-    
+
     country_map = {
         'USD': 'United States',
         'EUR': 'Euro Area',
@@ -339,7 +356,7 @@ def fetch_interest_rates_enhanced():
         'AUD': 'Australia',
         'NZD': 'New Zealand'
     }
-    
+
     rates = {}
     for curr, country in country_map.items():
         row = df_rates[df_rates.iloc[:, 0].astype(str).str.contains(country, case=False, na=False)]
@@ -349,19 +366,19 @@ def fetch_interest_rates_enhanced():
                 rates[curr] = rate_value
             except Exception:
                 pass
-    
+
     return rates
 
 def fetch_economic_indicators():
     """Fetch additional macro indicators: GDP growth, inflation, unemployment"""
     indicators = {}
-    
+
     # Try to fetch GDP growth rates
     try:
         url_gdp = "https://tradingeconomics.com/country-list/gdp-growth-rate"
         hdrs = {"User-Agent": "Mozilla/5.0"}
         tables = pd.read_html(requests.get(url_gdp, headers=hdrs, timeout=10).text)
-        
+
         if tables:
             df_gdp = tables[0].copy()
             country_map = {
@@ -369,7 +386,7 @@ def fetch_economic_indicators():
                 'JPY': 'Japan', 'CAD': 'Canada', 'CHF': 'Switzerland',
                 'AUD': 'Australia', 'NZD': 'New Zealand'
             }
-            
+
             for curr, country in country_map.items():
                 row = df_gdp[df_gdp.iloc[:, 0].astype(str).str.contains(country, case=False, na=False)]
                 if not row.empty:
@@ -380,12 +397,12 @@ def fetch_economic_indicators():
                         pass
     except Exception as e:
         print(f"Note: GDP data not available: {e}")
-    
+
     # Try to fetch inflation rates
     try:
         url_inf = "https://tradingeconomics.com/country-list/inflation-rate"
         tables = pd.read_html(requests.get(url_inf, headers=hdrs, timeout=10).text)
-        
+
         if tables:
             df_inf = tables[0].copy()
             for curr, country in country_map.items():
@@ -398,7 +415,7 @@ def fetch_economic_indicators():
                         pass
     except Exception as e:
         print(f"Note: Inflation data not available: {e}")
-    
+
     return indicators
 
 # Fetch rates and indicators
@@ -426,7 +443,7 @@ def fetch_news_sentiments():
         entries = feed.entries[:100]
     except Exception:
         return {}
-    
+
     cb_keywords = {
         'USD': ['Fed', 'Federal Reserve', 'FOMC', 'Powell'],
         'EUR': ['ECB', 'European Central Bank', 'Lagarde'],
@@ -437,20 +454,20 @@ def fetch_news_sentiments():
         'AUD': ['RBA', 'Reserve Bank of Australia'],
         'NZD': ['RBNZ', 'Reserve Bank of New Zealand']
     }
-    
+
     analyzer = SentimentIntensityAnalyzer()
     sentiment_scores = {curr: [] for curr in cb_keywords}
-    
+
     for entry in entries:
         title = entry.get('title', '')
         summary = entry.get('summary', '')
         text = f"{title}. {summary}"
-        
+
         for curr, keywords in cb_keywords.items():
             if any(key.lower() in text.lower() for key in keywords):
                 score = analyzer.polarity_scores(text)['compound']
                 sentiment_scores[curr].append(score)
-    
+
     # Average sentiment per currency
     sentiment_avg = {}
     for curr, scores in sentiment_scores.items():
@@ -458,7 +475,7 @@ def fetch_news_sentiments():
             sentiment_avg[curr] = np.mean(scores)
         else:
             sentiment_avg[curr] = 0.0
-    
+
     return sentiment_avg
 
 sentiments = fetch_news_sentiments()
@@ -473,19 +490,19 @@ print("\n[7/10] Computing momentum and technical indicators...")
 def compute_technical_indicators(prices, returns_data):
     """Compute multiple technical indicators for each currency"""
     indicators = {}
-    
+
     for cur in currencies:
         if cur not in prices.columns:
             continue
-        
+
         price_series = prices[cur].dropna()
         ret_series = returns_data[cur].dropna()
-        
+
         # 5-day, 20-day, 60-day momentum
         mom_5d = float(ret_series.tail(5).mean()) if len(ret_series) >= 5 else 0.0
         mom_20d = float(ret_series.tail(20).mean()) if len(ret_series) >= 20 else 0.0
         mom_60d = float(ret_series.tail(60).mean()) if len(ret_series) >= 60 else 0.0
-        
+
         # RSI (14-day)
         try:
             delta = price_series.diff()
@@ -495,36 +512,36 @@ def compute_technical_indicators(prices, returns_data):
             rsi = float(100 - (100 / (1 + rs.iloc[-1])))
         except:
             rsi = 50.0
-        
+
         # Bollinger Band position
         try:
             sma_20 = price_series.rolling(20).mean()
             std_20 = price_series.rolling(20).std()
             bb_upper = sma_20 + 2 * std_20
             bb_lower = sma_20 - 2 * std_20
-            bb_position = float((price_series.iloc[-1] - bb_lower.iloc[-1]) / 
+            bb_position = float((price_series.iloc[-1] - bb_lower.iloc[-1]) /
                                (bb_upper.iloc[-1] - bb_lower.iloc[-1]))
         except:
             bb_position = 0.5
-        
+
         # Trend strength (ADX approximation)
         try:
-            high = data_raw['High'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''), 
-                                                tickers.get('USD', 'DX-Y.NYB'))]
-            low = data_raw['Low'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''), 
-                                              tickers.get('USD', 'DX-Y.NYB'))]
-            
+            high = data_raw['High'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''),
+                                                tickers.get('USD', 'DX=F'))]  # FIX: updated fallback ticker
+            low = data_raw['Low'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''),
+                                              tickers.get('USD', 'DX=F'))]  # FIX: updated fallback ticker
+
             tr = pd.concat([
                 high - low,
                 abs(high - price_series.shift(1)),
                 abs(low - price_series.shift(1))
             ], axis=1).max(axis=1)
-            
+
             atr = tr.rolling(14).mean()
             trend_strength = float(atr.iloc[-1] / price_series.iloc[-1])
         except:
             trend_strength = 0.01
-        
+
         indicators[cur] = {
             'momentum_5d': mom_5d,
             'momentum_20d': mom_20d,
@@ -533,7 +550,7 @@ def compute_technical_indicators(prices, returns_data):
             'bb_position': bb_position,
             'trend_strength': trend_strength
         }
-    
+
     return indicators
 
 technical_indicators = compute_technical_indicators(closes, returns)
@@ -549,19 +566,19 @@ print("\n[8/10] Calculating expected returns with advanced models...")
 def calculate_carry_drift(rates_dict):
     """Calculate carry trade drift based on interest rate differentials"""
     carry_drift = {}
-    
+
     usd_rate = rates_dict.get('USD', 0.0)
-    
+
     for cur in currencies:
         base_ccy = cur.replace('USD', '').replace('Index', '').replace('_', '')
-        
+
         if base_ccy and base_ccy in rates_dict:
             # Annualized rate differential converted to daily
             rate_diff = (rates_dict[base_ccy] - usd_rate) / 100.0 / 252.0
             carry_drift[cur] = rate_diff
         elif cur == 'USD_Index':
             # USD Index: USD rate vs average of major currencies
-            major_rates = [rates_dict.get(c, 0) for c in ['EUR', 'GBP', 'JPY', 'CAD', 'CHF', 'AUD'] 
+            major_rates = [rates_dict.get(c, 0) for c in ['EUR', 'GBP', 'JPY', 'CAD', 'CHF', 'AUD']
                           if c in rates_dict]
             if major_rates:
                 avg_rate = np.mean(major_rates)
@@ -570,76 +587,76 @@ def calculate_carry_drift(rates_dict):
                 carry_drift[cur] = 0.0
         else:
             carry_drift[cur] = 0.0
-    
+
     return carry_drift
 
 def calculate_macro_drift(indicators_dict, rates_dict):
     """Calculate drift based on macro fundamentals"""
     macro_drift = {}
-    
+
     for cur in currencies:
         base_ccy = cur.replace('USD', '').replace('Index', '').replace('_', '')
-        
+
         # GDP growth differential
         gdp_key = f'{base_ccy}_GDP_GROWTH'
         usd_gdp_key = 'USD_GDP_GROWTH'
-        
+
         gdp_drift = 0.0
         if gdp_key in indicators_dict and usd_gdp_key in indicators_dict:
             gdp_diff = indicators_dict[gdp_key] - indicators_dict[usd_gdp_key]
             # GDP differential contributes to drift (higher growth -> stronger currency)
             gdp_drift = (gdp_diff / 100.0) / 252.0 * 0.5  # Scale down
-        
-        # Inflation differential (opposite effect - higher inflation weakens currency)
+
+        # Inflation differential (opposite effect - higher inflation strengthens currency)
         inf_key = f'{base_ccy}_INFLATION'
         usd_inf_key = 'USD_INFLATION'
-        
+
         inf_drift = 0.0
         if inf_key in indicators_dict and usd_inf_key in indicators_dict:
-            inf_diff = indicators_dict[usd_inf_key] - indicators_dict[inf_key]
+            inf_diff = indicators_dict[inf_key] - indicators_dict[usd_inf_key]
             inf_drift = (inf_diff / 100.0) / 252.0 * 0.3  # Scale down
-        
+
         macro_drift[cur] = gdp_drift + inf_drift
-    
+
     return macro_drift
 
 def calculate_sentiment_drift(sentiment_dict):
     """Calculate drift based on market sentiment"""
     sentiment_drift = {}
-    
+
     for cur in currencies:
         base_ccy = cur.replace('USD', '').replace('Index', '').replace('_', '')
-        
+
         if base_ccy == '':
             base_ccy = 'USD'
-        
+
         sent = sentiment_dict.get(base_ccy, 0.0)
         usd_sent = sentiment_dict.get('USD', 0.0)
-        
+
         # Sentiment differential scaled to daily drift
         sent_diff = sent - usd_sent
         sentiment_drift[cur] = sent_diff * 0.002  # ±0.2% daily max
-    
+
     return sentiment_drift
 
 def calculate_technical_drift(tech_dict):
     """Calculate drift based on technical indicators"""
     technical_drift = {}
-    
+
     for cur in currencies:
         if cur not in tech_dict:
             technical_drift[cur] = 0.0
             continue
-        
+
         indicators = tech_dict[cur]
-        
+
         # Momentum component (weighted average)
         mom_drift = (
             indicators['momentum_5d'] * 0.5 +
             indicators['momentum_20d'] * 0.3 +
             indicators['momentum_60d'] * 0.2
         )
-        
+
         # RSI mean reversion (extreme readings suggest reversal)
         rsi = indicators['rsi_14']
         if rsi > 70:
@@ -648,13 +665,13 @@ def calculate_technical_drift(tech_dict):
             rsi_drift = 0.001  # Oversold
         else:
             rsi_drift = 0.0
-        
+
         # Bollinger Band position
         bb = indicators['bb_position']
         bb_drift = (bb - 0.5) * 0.001  # Drift toward mean
-        
+
         technical_drift[cur] = mom_drift + rsi_drift - bb_drift  # Subtract BB for mean reversion
-    
+
     return technical_drift
 
 # Calculate all drift components
@@ -674,7 +691,7 @@ for cur in currencies:
         'sentiment': sentiment_drift.get(cur, 0.0),
         'technical': technical_drift.get(cur, 0.0)
     }
-    
+
     # Total drift with weights
     total_drift[cur] = (
         drift_components[cur]['carry'] * 0.35 +
@@ -692,7 +709,7 @@ print(f"✓ Calculated drift components for {len(drift_components)} pairs")
 
 print("\n[9/10] Running Monte Carlo simulations...")
 
-def simulate_prices_advanced(initial_price, drift, vol, regime_vol_adjust, days=1, trials=5000, 
+def simulate_prices_advanced(initial_price, drift, vol, regime_vol_adjust, days=1, trials=5000,
                             jump_prob=0.01, jump_mean=0, jump_std=0.02):
     """
     Advanced GBM simulation with:
@@ -702,28 +719,28 @@ def simulate_prices_advanced(initial_price, drift, vol, regime_vol_adjust, days=
     """
     np.random.seed(42)
     results = []
-    
+
     for _ in range(trials):
         price = initial_price
-        
+
         for t in range(days):
             # Student-t distributed returns (df=5 for fat tails)
             eps = stats.t.rvs(df=5, size=1)[0] / np.sqrt(5/3)  # Normalized
-            
+
             # Jump component (rare events)
             if np.random.rand() < jump_prob:
                 jump = np.random.normal(jump_mean, jump_std)
             else:
                 jump = 0
-            
+
             # Regime-adjusted volatility
             vol_adj = vol * regime_vol_adjust
-            
+
             # GBM + Jump
             price *= np.exp((drift - 0.5 * vol_adj**2) + vol_adj * eps + jump)
-        
+
         results.append(price)
-    
+
     return np.array(results)
 
 # Simulation parameters
@@ -740,15 +757,15 @@ sim_results = {h: {} for h in horizons}
 
 for horizon_name, days in horizons.items():
     print(f"  Simulating {horizon_name} horizon...")
-    
+
     for cur in currencies:
         if cur not in current_prices:
             continue
-        
+
         P0 = current_prices[cur]
         mu = total_drift.get(cur, 0.0)
         sigma = volatility_final.get(cur, 0.01)
-        
+
         # Regime adjustment factor
         if cur in regime_states:
             regime_vol_mult = regime_states[cur]['regime_1_vol'] / regime_states[cur]['regime_0_vol']
@@ -756,17 +773,22 @@ for horizon_name, days in horizons.items():
             regime_adjust = 1.0 + (regime_vol_mult - 1.0) * regime_prob
         else:
             regime_adjust = 1.0
-        
+
         # Run simulation
         final_prices = simulate_prices_advanced(
-            P0, mu, sigma, regime_adjust, 
+            P0, mu, sigma, regime_adjust,
             days=days, trials=trials,
             jump_prob=0.02, jump_mean=0, jump_std=0.03
         )
-        
+
         # Calculate statistics
         returns_sim = (final_prices / P0 - 1.0) * 100  # Percentage returns
-        
+
+        # FIX: guard CVaR calculation against empty tail slice
+        p5_threshold = np.percentile(returns_sim, 5)
+        tail_returns = returns_sim[returns_sim <= p5_threshold]
+        cvar_95 = float(-np.mean(tail_returns)) if len(tail_returns) > 0 else float(-p5_threshold)
+
         sim_results[horizon_name][cur] = {
             'mean_return': float(np.mean(returns_sim)),
             'median_return': float(np.median(returns_sim)),
@@ -777,8 +799,8 @@ for horizon_name, days in horizons.items():
             'p25': float(np.percentile(returns_sim, 25)),
             'p75': float(np.percentile(returns_sim, 75)),
             'p95': float(np.percentile(returns_sim, 95)),
-            'VaR_95': float(-np.percentile(returns_sim, 5)),
-            'CVaR_95': float(-np.mean(returns_sim[returns_sim <= np.percentile(returns_sim, 5)])),
+            'VaR_95': float(-p5_threshold),
+            'CVaR_95': cvar_95,  # FIX: use guarded value
             'prob_up': float(np.mean(final_prices > P0)),
             'expected_price': float(np.mean(final_prices)),
             'expected_range_low': float(np.percentile(final_prices, 16)),
@@ -817,12 +839,12 @@ def calculate_omega_ratio(returns_sim, threshold=0.0):
     """Calculate Omega ratio (probability-weighted gains/losses)"""
     gains = returns_sim[returns_sim > threshold] - threshold
     losses = threshold - returns_sim[returns_sim <= threshold]
-    
+
     if len(losses) == 0:
         return float('inf')
     if len(gains) == 0:
         return 0.0
-    
+
     return np.sum(gains) / np.sum(losses)
 
 # Calculate comprehensive rankings
@@ -832,27 +854,27 @@ for cur in currencies:
     # Use 1-week horizon for ranking
     if '1w' not in sim_results or cur not in sim_results['1w']:
         continue
-    
+
     stats_1w = sim_results['1w'][cur]
-    
+
     # Risk-adjusted metrics
     sharpe = calculate_sharpe_ratio(stats_1w['mean_return'], stats_1w['std_return'])
-    
+
     # For Sortino, we need the full return distribution (approximate from stats)
     returns_approx = np.random.normal(
-        stats_1w['mean_return'], 
-        stats_1w['std_return'], 
+        stats_1w['mean_return'],
+        stats_1w['std_return'],
         1000
     )
     sortino = calculate_sortino_ratio(returns_approx)
     omega = calculate_omega_ratio(returns_approx)
-    
+
     # Return-to-VaR ratio
     return_to_var = stats_1w['mean_return'] / stats_1w['VaR_95'] if stats_1w['VaR_95'] > 0 else 0
-    
+
     # Volatility-adjusted return
     vol_adj_return = stats_1w['mean_return'] / volatility_final.get(cur, 0.01)
-    
+
     # Composite score (weighted combination)
     composite_score = (
         sharpe * 0.25 +
@@ -861,7 +883,7 @@ for cur in currencies:
         return_to_var * 0.20 +
         vol_adj_return * 0.20
     )
-    
+
     pair_rankings[cur] = {
         'expected_return_1w': stats_1w['mean_return'],
         'volatility': volatility_final.get(cur, 0.01) * 100 * np.sqrt(252),  # Annualized
@@ -937,7 +959,7 @@ print("=" * 80)
 try:
     bt_file = 'fx_forecast_backtest.csv'
     today_stamp = pd.Timestamp.utcnow().normalize()
-    
+
     bt_rows = []
     for cur in currencies:
         bt_rows.append({
@@ -950,28 +972,28 @@ try:
             'realized_vol': np.nan,
             'forecast_error': np.nan
         })
-    
+
     new_bt = pd.DataFrame(bt_rows)
-    
+
     # Load existing backtest data
     try:
         old_bt = pd.read_csv(bt_file)
-        
+
         # Fill in realized returns from 1 week ago
         one_week_ago = (today_stamp - pd.Timedelta(days=7)).date()
         mask_past = old_bt['date'] == str(one_week_ago)
-        
+
         if mask_past.any():
             for cur in currencies:
                 if cur not in returns.columns:
                     continue
-                
+
                 # Calculate actual 5-day return
                 try:
                     recent_returns = returns[cur].tail(5)
                     realized_ret = float(recent_returns.sum() * 100)
                     realized_vol = float(recent_returns.std() * 100)
-                    
+
                     idx = old_bt.index[mask_past & (old_bt['currency'] == cur)]
                     if len(idx) > 0:
                         forecast_ret = old_bt.loc[idx[0], 'forecast_return_1w']
@@ -981,30 +1003,30 @@ try:
                             old_bt.loc[idx, 'forecast_error'] = abs(realized_ret - forecast_ret)
                 except Exception:
                     pass
-        
+
         bt_all = pd.concat([old_bt, new_bt], ignore_index=True)
     except FileNotFoundError:
         bt_all = new_bt
-    
+
     bt_all = bt_all.drop_duplicates(subset=['date', 'currency'], keep='last')
     bt_all.to_csv(bt_file, index=False)
-    
+
     # Calculate accuracy metrics
     completed = bt_all.dropna(subset=['forecast_return_1w', 'realized_return_1w'])
     if not completed.empty:
         mae = completed['forecast_error'].mean()
         rmse = np.sqrt((completed['forecast_error'] ** 2).mean())
-        
+
         # Direction accuracy
         forecast_sign = np.sign(completed['forecast_return_1w'])
         realized_sign = np.sign(completed['realized_return_1w'])
         direction_accuracy = (forecast_sign == realized_sign).mean()
-        
+
         print(f"\n📈 Forecast Accuracy (last {len(completed)} forecasts):")
         print(f"   Mean Absolute Error: {mae:.2f}%")
         print(f"   Root Mean Squared Error: {rmse:.2f}%")
         print(f"   Direction Accuracy: {direction_accuracy:.1%}")
-        
+
         # Save metrics
         pd.DataFrame([{
             'mae': mae,
@@ -1035,19 +1057,19 @@ print(corr_matrix.round(2).to_string())
 try:
     scaler = StandardScaler()
     returns_scaled = scaler.fit_transform(returns[currencies].dropna())
-    
+
     pca = PCA(n_components=3)
     pca.fit(returns_scaled)
-    
+
     print(f"\n📊 Principal Components Analysis:")
     print(f"   PC1 explains {pca.explained_variance_ratio_[0]:.1%} of variance")
     print(f"   PC2 explains {pca.explained_variance_ratio_[1]:.1%} of variance")
     print(f"   PC3 explains {pca.explained_variance_ratio_[2]:.1%} of variance")
-    
+
     # PC1 loadings (likely USD factor)
     pc1_loadings = pd.Series(pca.components_[0], index=currencies)
     pc1_loadings.to_csv('pca_loadings.csv')
-    
+
     print(f"\n   PC1 Loadings (USD Factor):")
     for curr, loading in pc1_loadings.items():
         print(f"      {curr}: {loading:.3f}")
@@ -1065,7 +1087,7 @@ print("=" * 80)
 
 for cur in rankings_df.head(3).index:
     stats_1w = sim_results['1w'][cur]
-    
+
     print(f"\n{cur}:")
     print(f"  Expected Return: {stats_1w['mean_return']:.2f}%")
     print(f"  95% VaR: {stats_1w['VaR_95']:.2f}%")
