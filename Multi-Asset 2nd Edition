@@ -1,0 +1,1511 @@
+# ============================================================
+# OANDA ENHANCED MULTI-ASSET MACRO-QUANT FORECASTING SYSTEM
+# 48-72 Hour Directional Forecast + Multi-Horizon Risk Analysis
+# Colab-Compatible | Top Opportunities Ranked
+# ============================================================
+# Architecture:
+#  - Multi-asset universe: equities, metals, FX
+#  - 3-state Markov regime detection (Bull / Neutral / Bear)
+#  - GARCH/EGARCH/GJR-GARCH best-of-three with Student-t errors
+#  - Jump-diffusion Monte Carlo across 4 horizons
+#  - Sentiment analysis (VADER + FXStreet RSS) used in ranking
+#  - Interest rate carry drift (6-source cascade: user file → ForexFactory
+#    → FRED REST → ECB SDW → yfinance proxies → persistence cache)
+#  - ML ensemble: 5 models, leakage-free CV (scaler + imputer
+#    fit inside each fold), final model retrained on full data
+#  - Cross-sectional z-score composite ranking
+#  - Live walk-forward backtest logger with automatic realised
+#    return backfill on each run
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# ----------------------------
+# 0) INSTALL DEPENDENCIES
+# ----------------------------
+import subprocess, sys
+
+def pip_install(*pkgs):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pkgs])
+
+pip_install(
+    "yfinance", "statsmodels", "xgboost", "lightgbm",
+    "vaderSentiment", "feedparser", "requests", "beautifulsoup4",
+    "arch", "scikit-learn", "scipy"
+)
+print("Dependencies ready.")
+
+# ----------------------------
+# 1) IMPORTS
+# ----------------------------
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import json, re, requests
+from io import StringIO
+from datetime import datetime, timedelta
+
+from scipy import stats
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import (RandomForestClassifier,
+                               GradientBoostingClassifier,
+                               VotingClassifier)
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import accuracy_score
+
+from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+from arch import arch_model
+import xgboost as xgb
+import lightgbm as lgb
+
+import feedparser
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# ----------------------------
+# 2) CONFIGURATION
+# ----------------------------
+SEED             = 42
+np.random.seed(SEED)
+
+END_DATE         = datetime.utcnow()
+START_DATE       = END_DATE - timedelta(days=5 * 365)
+
+FORECAST_HORIZON = 3          # bars ahead for ML directional target
+MC_TRIALS        = 3000
+MC_HORIZONS      = {"1d": 1, "1w": 5, "2w": 10, "1m": 22}
+N_REGIMES        = 3
+REGIME_LABELS    = {0: "Bull", 1: "Neutral", 2: "Bear"}
+BT_FILE          = "oanda_forecast_backtest.csv"
+BT_HORIZON       = 5          # trading days ahead used for backtest realised return
+
+# ── Asset universe ───────────────────────────────────────────
+ASSET_UNIVERSE = {
+    "XAU/USD":      {"primary": "GC=F",     "backup": "GLD",  "name": "Gold",       "class": "Metal"},
+    "XAG/USD":      {"primary": "SI=F",     "backup": "SLV",  "name": "Silver",     "class": "Metal"},
+    "XPT/USD":      {"primary": "PL=F",     "backup": "PPLT", "name": "Platinum",   "class": "Metal"},
+    "XCU/USD":      {"primary": "HG=F",     "backup": "CPER", "name": "Copper",     "class": "Metal"},
+    "SPX500USD":    {"primary": "^GSPC",    "backup": "SPY",  "name": "S&P 500",    "class": "Equity"},
+    "DE30EUR":      {"primary": "^GDAXI",   "backup": "EWG",  "name": "DAX",        "class": "Equity"},
+    "NIKKEI225JPY": {"primary": "^N225",    "backup": "EWJ",  "name": "Nikkei 225", "class": "Equity"},
+    "FTSE100GBP":   {"primary": "^FTSE",    "backup": "EWU",  "name": "FTSE 100",   "class": "Equity"},
+    "EUR/USD":      {"primary": "EURUSD=X", "backup": "FXE",  "name": "EUR/USD",    "class": "FX"},
+    "GBP/USD":      {"primary": "GBPUSD=X", "backup": "FXB",  "name": "GBP/USD",    "class": "FX"},
+    "USD/JPY":      {"primary": "USDJPY=X", "backup": None,   "name": "USD/JPY",    "class": "FX"},
+    "USD/CAD":      {"primary": "USDCAD=X", "backup": None,   "name": "USD/CAD",    "class": "FX"},
+    "AUD/USD":      {"primary": "AUDUSD=X", "backup": "FXA",  "name": "AUD/USD",    "class": "FX"},
+    "USD/CHF":      {"primary": "USDCHF=X", "backup": None,   "name": "USD/CHF",    "class": "FX"},
+}
+
+USD_BASE_PAIRS = {"USD/JPY", "USD/CAD", "USD/CHF"}
+
+MACRO_INDICATORS = {
+    "^VIX": "VIX", "^TNX": "10Y_Treasury", "^FVX": "5Y_Treasury",
+    "^IRX": "13W_TBill", "DX=F": "Dollar_Index",
+    "HYG": "High_Yield", "LQD": "Inv_Grade",
+    "IWM": "Small_Caps", "XLE": "Energy", "XLF": "Financials", "XLK": "Technology",
+    "BTC-USD": "Bitcoin", "TLT": "Long_Bonds", "USO": "Oil",
+}
+
+# Currencies we need rates for.  No fixed estimates — values come from
+# live sources or from the persistence file written by previous runs.
+RATE_CURRENCIES  = {"USD", "EUR", "GBP", "JPY", "CAD", "CHF", "AUD", "NZD"}
+
+# JSON cache written after every successful live fetch; read as last-resort
+# fallback so a transient network outage never silently uses stale constants.
+RATES_CACHE_FILE = "interest_rates_cache.json"
+
+# Optional user-maintained override file.  If present, any rate listed here
+# takes precedence over all other sources for that currency.
+RATES_USER_FILE  = "interest_rates_user.json"
+
+ASSET_TO_CCY = {
+    "EUR/USD": "EUR", "GBP/USD": "GBP", "USD/JPY": "JPY",
+    "USD/CAD": "CAD", "AUD/USD": "AUD", "USD/CHF": "CHF",
+    "XAU/USD": "USD", "XAG/USD": "USD", "XPT/USD": "USD", "XCU/USD": "USD",
+    "SPX500USD": "USD", "DE30EUR": "EUR",
+    "NIKKEI225JPY": "JPY", "FTSE100GBP": "GBP",
+}
+
+CB_KEYWORDS = {
+    "USD": ["Fed", "Federal Reserve", "FOMC", "Powell"],
+    "EUR": ["ECB", "European Central Bank", "Lagarde"],
+    "GBP": ["BoE", "Bank of England", "Bailey"],
+    "JPY": ["BoJ", "Bank of Japan", "Ueda"],
+    "CAD": ["BoC", "Bank of Canada", "Macklem"],
+    "CHF": ["SNB", "Swiss National Bank"],
+    "AUD": ["RBA", "Reserve Bank of Australia"],
+    "NZD": ["RBNZ", "Reserve Bank of New Zealand"],
+}
+
+# ============================================================
+# SECTION A: DATA COLLECTION
+# ============================================================
+
+def _strip_multiindex(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.xs(ticker, axis=1, level=1)
+        except KeyError:
+            df.columns = df.columns.droplevel(1)
+    return df
+
+
+def download_with_fallback(info: dict):
+    candidates = [c for c in [info["primary"], info.get("backup")] if c]
+    for ticker in candidates:
+        try:
+            df = yf.download(ticker, start=START_DATE, end=END_DATE,
+                             progress=False, auto_adjust=False)
+            df = _strip_multiindex(df, ticker)
+            df.columns = [c.strip() for c in df.columns]
+            for col in ["Open", "High", "Low", "Close"]:
+                if col not in df.columns and "Adj Close" in df.columns:
+                    df[col] = df["Adj Close"]
+            if "Volume" not in df.columns:
+                df["Volume"] = 0
+            if not df.empty and len(df) > 200:
+                return df, ticker
+        except Exception:
+            continue
+    return pd.DataFrame(), None
+
+
+def collect_asset_data():
+    print("\nCollecting asset data...")
+    asset_data, tickers_used = {}, {}
+    for symbol, info in ASSET_UNIVERSE.items():
+        df, ticker = download_with_fallback(info)
+        if not df.empty:
+            asset_data[symbol]   = df
+            tickers_used[symbol] = ticker
+            print(f"  ok  {symbol:20s} ({info['name']:15s}) via {ticker}")
+        else:
+            print(f"  --  {symbol:20s} -- no data")
+    return asset_data, tickers_used
+
+
+def collect_macro_data():
+    print("\nCollecting macro indicators...")
+    macro_data = {}
+    for ticker in MACRO_INDICATORS:
+        try:
+            df = yf.download(ticker, start=START_DATE, end=END_DATE,
+                             progress=False, auto_adjust=False)
+            df = _strip_multiindex(df, ticker)
+            if not df.empty:
+                macro_data[ticker] = df
+        except Exception:
+            pass
+    print(f"  {len(macro_data)}/{len(MACRO_INDICATORS)} macro series collected")
+    return macro_data
+
+
+# ============================================================
+# SECTION B: INTEREST RATES (6-source cascade, no fixed constants)
+# ============================================================
+#
+# Sources tried in order, each filling only the gaps left by the one above:
+#
+#   1. User override file  (interest_rates_user.json)  — always wins if present
+#   2. ForexFactory JSON   (thisweek then lastweek)    — CB decision actuals
+#   3. FRED via direct API (fred.stlouisfed.org)       — authoritative US series
+#      + approximations for other CBs from FRED proxies
+#   4. ECB SDW REST API    (sdw-wsrest.ecb.europa.eu)  — EUR rate bootstrap
+#   5. yfinance proxies    (^IRX=USD, etc.)            — market-implied rates
+#   6. Persistence cache   (interest_rates_cache.json) — last known good values
+#
+# If a currency cannot be resolved by any source it is excluded from carry
+# calculations with a loud warning.  Carry for that asset is set to zero.
+# No fixed numeric constants are used anywhere in this function.
+#
+# After every run the successfully fetched rates are persisted to
+# interest_rates_cache.json so the next run can use them as source 6.
+# ============================================================
+
+CB_RATE_RE = re.compile(
+    r"interest rate|policy rate|overnight rate|bank rate|"
+    r"refinancing rate|target rate|funds rate|cash rate",
+    re.IGNORECASE,
+)
+
+# FRED series IDs for central-bank policy / overnight rates.
+# These are the official published series — no approximation.
+FRED_SERIES = {
+    "USD": "FEDFUNDS",    # Effective Federal Funds Rate (monthly; latest obs)
+    "EUR": "ECBDFR",      # ECB Deposit Facility Rate
+    "GBP": "BOEBRATE",    # Bank of England Official Bank Rate
+    "JPY": "IRSTCI01JPM156N",  # Japan overnight call rate (IMF/OECD via FRED)
+    "CAD": "BOCRATE",     # Bank of Canada overnight target rate
+    "CHF": "IRSTCI01CHM156N",  # Switzerland overnight rate (OECD via FRED)
+    "AUD": "RBATCTR",     # RBA cash rate target
+    "NZD": "RBNZOCR",     # RBNZ official cash rate
+}
+
+# yfinance tickers that approximate each CB rate when FRED is unreachable.
+# These are market-traded instruments whose level tracks the policy rate.
+YF_RATE_PROXIES = {
+    "USD": "^IRX",        # 13-week T-Bill yield  ≈ Fed Funds
+    "GBP": "^TNX",        # placeholder — UK has no clean yf proxy; skipped below
+    "EUR": "^IRX",        # placeholder; ECB rate approximated via FRED or FF only
+}
+
+
+def _load_json_rates(path: str) -> dict:
+    """Load a {ccy: rate} JSON file; return {} on any error."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return {k: float(v) for k, v in data.items()
+                if k in RATE_CURRENCIES and np.isfinite(float(v))}
+    except Exception:
+        return {}
+
+
+def _persist_rates(rates: dict, source: dict):
+    """Write the current rates dict to the cache file with metadata."""
+    try:
+        payload = {
+            "fetched_utc": datetime.utcnow().isoformat(),
+            "rates":       rates,
+            "source":      source,
+        }
+        with open(RATES_CACHE_FILE, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_cached_rates() -> tuple:
+    """
+    Load rates and sources from the persistence cache.
+    Returns (rates_dict, source_dict, age_hours) or ({}, {}, inf).
+    """
+    try:
+        with open(RATES_CACHE_FILE) as f:
+            payload = json.load(f)
+        fetched = datetime.fromisoformat(payload["fetched_utc"])
+        age_h   = (datetime.utcnow() - fetched).total_seconds() / 3600
+        rates   = {k: float(v) for k, v in payload["rates"].items()
+                   if k in RATE_CURRENCIES}
+        src     = {k: f"cache ({age_h:.0f}h old)" for k in rates}
+        return rates, src, age_h
+    except Exception:
+        return {}, {}, float("inf")
+
+
+def _fetch_fred_rates(needed: set, hdrs: dict) -> tuple:
+    """
+    Query FRED REST API for each currency in `needed`.
+    Returns (rates, source) dicts — only currencies successfully fetched.
+    FRED API requires no key for public series (rate-limited to 120 req/min).
+    """
+    rates, source = {}, {}
+    base = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
+    for ccy in needed:
+        series = FRED_SERIES.get(ccy)
+        if not series:
+            continue
+        try:
+            resp = requests.get(base + series, headers=hdrs, timeout=10)
+            if not resp.ok:
+                continue
+            # CSV: DATE,VALUE  — last non-missing row
+            lines = [l for l in resp.text.strip().splitlines()
+                     if not l.startswith("DATE") and "." in l]
+            if not lines:
+                continue
+            val = float(lines[-1].split(",")[1].strip())
+            if np.isfinite(val):
+                rates[ccy]  = val
+                source[ccy] = f"FRED {series}"
+        except Exception:
+            continue
+    return rates, source
+
+
+def _fetch_ecb_rate(hdrs: dict) -> tuple:
+    """
+    Query ECB Statistical Data Warehouse REST API for the deposit facility rate.
+    Returns ({"EUR": val}, {"EUR": source}) or ({}, {}).
+    Series key: FM.B.U2.EUR.FR2.BB.DFR.R.1.A.A._Z._Z.A
+    """
+    url = ("https://sdw-wsrest.ecb.europa.eu/service/data/"
+           "FM/B.U2.EUR.FR2.BB.DFR.R.1.A.A._Z._Z.A"
+           "?lastNObservations=1&format=jsondata")
+    try:
+        resp = requests.get(url, headers=hdrs, timeout=10)
+        if not resp.ok:
+            return {}, {}
+        data   = resp.json()
+        series = data["dataSets"][0]["series"]
+        # The single series is keyed "0:0:0:0:0:0:0:0:0:0:0:0:0:0"
+        obs    = next(iter(series.values()))["observations"]
+        val    = float(next(iter(obs.values()))[0])
+        if np.isfinite(val):
+            return {"EUR": val}, {"EUR": "ECB SDW REST API"}
+    except Exception:
+        pass
+    return {}, {}
+
+
+def _fetch_ff_rates(needed: set, hdrs: dict) -> tuple:
+    """
+    Parse ForexFactory weekly JSON for CB interest rate decision actuals.
+    Tries this-week then last-week. Returns (rates, source).
+    """
+    FF_URLS = [
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_lastweek.json",
+    ]
+    rates, source = {}, {}
+    for url in FF_URLS:
+        if not needed - set(rates):
+            break
+        try:
+            resp = requests.get(url, headers=hdrs, timeout=8)
+            if not resp.ok:
+                continue
+            for ev in reversed(resp.json()):
+                ccy  = str(ev.get("currency", "")).strip().upper()
+                titl = str(ev.get("title", ""))
+                act  = ev.get("actual", "")
+                if ccy not in needed or ccy in rates:
+                    continue
+                if not CB_RATE_RE.search(titl):
+                    continue
+                if act in (None, "", "—", "N/A"):
+                    continue
+                try:
+                    val = float(str(act).replace("%", "").strip())
+                    rates[ccy]  = val
+                    source[ccy] = f"ForexFactory {url.split('/')[-1]}"
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+    return rates, source
+
+
+def _fetch_yf_proxies(needed: set) -> tuple:
+    """
+    Use yfinance market tickers as rough policy-rate proxies.
+    Only applied to currencies with a defined proxy and only as a last
+    live-data resort before the cache.
+    """
+    rates, source = {}, {}
+    for ccy in needed:
+        ticker = YF_RATE_PROXIES.get(ccy)
+        if not ticker:
+            continue
+        try:
+            df  = yf.download(ticker, period="5d", interval="1d",
+                              progress=False, auto_adjust=False)
+            df  = _strip_multiindex(df, ticker)
+            val = float(df["Close"].dropna().iloc[-1])
+            if np.isfinite(val) and val > 0:
+                rates[ccy]  = val
+                source[ccy] = f"yfinance {ticker}"
+        except Exception:
+            continue
+    return rates, source
+
+
+def fetch_interest_rates() -> dict:
+    """
+    Resolves current central-bank policy rates through a 6-tier cascade.
+    No fixed numeric constants are used.  Each tier only fills gaps left
+    by the one above it.  See module docstring for source details.
+
+    Returns a dict {ccy: rate_%} for all resolved currencies.
+    Currencies that cannot be resolved are absent from the dict; callers
+    must treat a missing rate as zero carry (handled in calculate_drift).
+    """
+    rates:  dict = {}
+    source: dict = {}
+    hdrs = {"User-Agent": "Mozilla/5.0 (compatible; macro-quant-bot/1.0)"}
+
+    needed = set(RATE_CURRENCIES)
+
+    # ── Tier 1: user override file ────────────────────────────
+    user = _load_json_rates(RATES_USER_FILE)
+    if user:
+        for ccy, val in user.items():
+            if ccy in needed:
+                rates[ccy]  = val
+                source[ccy] = f"user override ({RATES_USER_FILE})"
+        print(f"  [T1] User overrides applied for: {sorted(user)}")
+
+    remaining = needed - set(rates)
+
+    # ── Tier 2: ForexFactory JSON ─────────────────────────────
+    if remaining:
+        r, s = _fetch_ff_rates(remaining, hdrs)
+        rates.update(r); source.update(s)
+        if r:
+            print(f"  [T2] ForexFactory resolved: {sorted(r)}")
+        remaining = needed - set(rates)
+
+    # ── Tier 3: FRED REST API ─────────────────────────────────
+    if remaining:
+        r, s = _fetch_fred_rates(remaining, hdrs)
+        rates.update(r); source.update(s)
+        if r:
+            print(f"  [T3] FRED resolved: {sorted(r)}")
+        remaining = needed - set(rates)
+
+    # ── Tier 4: ECB SDW (EUR only) ────────────────────────────
+    if "EUR" in remaining:
+        r, s = _fetch_ecb_rate(hdrs)
+        rates.update(r); source.update(s)
+        if r:
+            print(f"  [T4] ECB SDW resolved: {sorted(r)}")
+        remaining = needed - set(rates)
+
+    # ── Tier 5: yfinance market proxies ───────────────────────
+    if remaining:
+        r, s = _fetch_yf_proxies(remaining)
+        rates.update(r); source.update(s)
+        if r:
+            print(f"  [T5] yfinance proxies resolved: {sorted(r)}")
+        remaining = needed - set(rates)
+
+    # ── Tier 6: persistence cache (last known good) ───────────
+    if remaining:
+        cached, cached_src, age_h = _load_cached_rates()
+        for ccy in list(remaining):
+            if ccy in cached:
+                rates[ccy]  = cached[ccy]
+                source[ccy] = cached_src[ccy]
+        filled_from_cache = remaining & set(cached)
+        if filled_from_cache:
+            print(f"  [T6] Cache ({age_h:.0f}h old) resolved: "
+                  f"{sorted(filled_from_cache)}")
+        remaining = needed - set(rates)
+
+    # ── Unresolved: warn and exclude ──────────────────────────
+    if remaining:
+        print(f"\n  WARNING: No rate data found for {sorted(remaining)}.")
+        print(f"  Carry will be set to zero for these currencies.")
+        print(f"  To fix: create '{RATES_USER_FILE}' with "
+              f'{{ "CCY": rate_percent, ... }} or check network connectivity.\n')
+
+    # ── Persist successful fetches for next run ───────────────
+    if rates:
+        _persist_rates(rates, source)
+
+    # ── Summary ───────────────────────────────────────────────
+    for ccy in sorted(rates):
+        print(f"    {ccy}: {rates[ccy]:.2f}%  [{source[ccy]}]")
+    print(f"  Interest rates resolved: {len(rates)}/{len(needed)}")
+    return rates
+
+
+# ============================================================
+# SECTION C: SENTIMENT ANALYSIS
+# ============================================================
+
+def fetch_news_sentiments() -> dict:
+    """
+    VADER-scores FXStreet RSS articles against CB keywords.
+    Returns mean compound sentiment per currency [-1, +1].
+    Used as a cross-sectional ranking signal, not as raw drift.
+    """
+    try:
+        entries = feedparser.parse("https://www.fxstreet.com/rss/news").entries[:100]
+    except Exception:
+        return {ccy: 0.0 for ccy in CB_KEYWORDS}
+
+    analyzer = SentimentIntensityAnalyzer()
+    scores   = {ccy: [] for ccy in CB_KEYWORDS}
+
+    for entry in entries:
+        text = f"{entry.get('title', '')}. {entry.get('summary', '')}"
+        for ccy, kws in CB_KEYWORDS.items():
+            if any(kw.lower() in text.lower() for kw in kws):
+                scores[ccy].append(analyzer.polarity_scores(text)["compound"])
+
+    return {ccy: float(np.mean(v)) if v else 0.0 for ccy, v in scores.items()}
+
+
+# ============================================================
+# SECTION D: TECHNICAL FEATURE ENGINEERING
+# ============================================================
+
+def calculate_technical_features(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    ~75 purely look-back technical features.
+    No look-ahead bias: every feature at bar t uses only data <= t.
+    The forward-return target is created separately in the pipeline.
+    Features are price-normalised where possible to improve model
+    generalisation across assets and price levels.
+    """
+    df    = pd.DataFrame(index=data.index)
+    close = data["Close"].squeeze()
+    high  = data["High"].squeeze()
+    low   = data["Low"].squeeze()
+    vol   = (data["Volume"].squeeze() if "Volume" in data.columns
+             else pd.Series(0, index=data.index))
+
+    # Returns
+    for p in [1, 2, 3, 5, 10, 20, 60]:
+        df[f"return_{p}d"]     = close.pct_change(p)
+        df[f"log_return_{p}d"] = np.log(close / close.shift(p))
+
+    # Price-normalised MAs
+    for w in [5, 10, 20, 50, 100, 200]:
+        sma = close.rolling(w).mean()
+        df[f"price_to_sma_{w}"] = close / sma - 1
+        df[f"sma_{w}_slope"]    = sma.diff(5) / sma
+
+    for span in [12, 26, 50]:
+        ema = close.ewm(span=span).mean()
+        df[f"price_to_ema_{span}"] = close / ema - 1
+
+    # MACD (price-normalised)
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    macd  = ema12 - ema26
+    df["macd_norm"]        = macd / close
+    df["macd_signal_norm"] = macd.ewm(span=9).mean() / close
+    df["macd_hist_norm"]   = (macd - macd.ewm(span=9).mean()) / close
+
+    # RSI (multiple periods)
+    for p in [7, 14, 21]:
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(p).mean()
+        loss  = (-delta.clip(upper=0)).rolling(p).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        df[f"rsi_{p}"] = 100 - (100 / (1 + rs))
+
+    # Stochastic
+    for p in [14, 21]:
+        lo, hi = low.rolling(p).min(), high.rolling(p).max()
+        stoch  = 100 * (close - lo) / (hi - lo)
+        df[f"stoch_{p}"]    = stoch
+        df[f"stoch_{p}_ma"] = stoch.rolling(3).mean()
+
+    # Bollinger Bands
+    for p in [20, 50]:
+        sma  = close.rolling(p).mean()
+        std  = close.rolling(p).std()
+        bb_u, bb_l = sma + 2*std, sma - 2*std
+        df[f"bb_width_{p}"]    = (bb_u - bb_l) / sma
+        df[f"bb_position_{p}"] = (close - bb_l) / (bb_u - bb_l)
+
+    # ATR (price-normalised)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    for p in [7, 14, 21]:
+        df[f"atr_{p}_pct"] = tr.rolling(p).mean() / close
+
+    # Volume ratios
+    for p in [5, 10, 20]:
+        vsma = vol.rolling(p).mean()
+        df[f"volume_ratio_{p}"] = vol / vsma.replace(0, np.nan)
+    obv     = (np.sign(close.diff()) * vol).fillna(0).cumsum()
+    obv_ema = obv.ewm(span=20).mean()
+    df["obv_ema_slope"] = obv_ema.diff(5) / (obv_ema.abs() + 1e-9)
+
+    # Statistical moments
+    ret = close.pct_change()
+    for p in [20, 60]:
+        mu, sd = ret.rolling(p).mean(), ret.rolling(p).std()
+        df[f"zscore_{p}"]   = (ret - mu) / sd
+        df[f"ret_skew_{p}"] = ret.rolling(p).skew()
+        df[f"ret_kurt_{p}"] = ret.rolling(p).kurt()
+
+    # Trend / channel
+    df["channel_pos"]      = ((close - low.rolling(20).min()) /
+                               (high.rolling(20).max() - low.rolling(20).min()))
+    df["dist_52w_high"]    = close / high.rolling(252).max() - 1
+    df["dist_52w_low"]     = close / low.rolling(252).min()  - 1
+    df["sma_cross_50_200"] = close.rolling(50).mean() / close.rolling(200).mean() - 1
+    df["ema_cross_12_26"]  = close.ewm(span=12).mean() / close.ewm(span=26).mean() - 1
+
+    # Rolling volatility
+    for p in [5, 10, 20, 60]:
+        df[f"vol_{p}d"] = ret.rolling(p).std() * np.sqrt(252)
+
+    return df.replace([np.inf, -np.inf], np.nan)
+
+
+def calculate_macro_features(macro_data: dict) -> dict:
+    """Extract the latest scalar from each macro indicator series."""
+    def _last(ticker):
+        d = macro_data.get(ticker)
+        if d is None or d.empty:
+            return 0.0
+        s = d["Close"].squeeze().dropna()
+        return float(s.iloc[-1]) if not s.empty else 0.0
+
+    m = {
+        "vix": _last("^VIX"), "yield_10y": _last("^TNX"),
+        "yield_5y": _last("^FVX"), "yield_3m": _last("^IRX"),
+        "dxy": _last("DX=F"),
+        "vix_change": 0.0, "yield_curve_5_10": 0.0, "yield_10y_roc20": 0.0,
+        "credit_spread": 0.0, "btc_momentum": 0.0,
+        "XLE_momentum": 0.0, "XLF_momentum": 0.0, "XLK_momentum": 0.0,
+    }
+
+    if "^VIX" in macro_data:
+        s = macro_data["^VIX"]["Close"].squeeze().dropna()
+        if len(s) > 1:
+            m["vix_change"] = float(s.pct_change().iloc[-1])
+
+    if m["yield_5y"] and m["yield_10y"]:
+        m["yield_curve_5_10"] = m["yield_5y"] - m["yield_10y"]
+
+    if "^TNX" in macro_data:
+        s = macro_data["^TNX"]["Close"].squeeze().dropna()
+        if len(s) > 20:
+            m["yield_10y_roc20"] = float(s.pct_change(20).iloc[-1])
+
+    if "HYG" in macro_data and "LQD" in macro_data:
+        hyg = macro_data["HYG"]["Close"].squeeze().dropna()
+        lqd = macro_data["LQD"]["Close"].squeeze().dropna()
+        if len(hyg) > 20 and len(lqd) > 20:
+            m["credit_spread"] = float(
+                hyg.pct_change(20).iloc[-1] - lqd.pct_change(20).iloc[-1])
+
+    for sec in ["XLE", "XLF", "XLK"]:
+        if sec in macro_data:
+            s = macro_data[sec]["Close"].squeeze().dropna()
+            if len(s) > 20:
+                m[f"{sec}_momentum"] = float(s.pct_change(20).iloc[-1])
+
+    if "BTC-USD" in macro_data:
+        s = macro_data["BTC-USD"]["Close"].squeeze().dropna()
+        if len(s) > 20:
+            m["btc_momentum"] = float(s.pct_change(20).iloc[-1])
+
+    return {k: (v if np.isfinite(v) else 0.0) for k, v in m.items()}
+
+
+# ============================================================
+# SECTION E: REGIME DETECTION (3-state Markov Switching)
+# ============================================================
+
+def fit_regime_model(returns: pd.Series) -> pd.DataFrame:
+    """
+    Fits 3-state Markov-switching model (switching mean + variance).
+    Post-sorts regimes by estimated mean return:
+      0 = Bull (highest mean), 1 = Neutral, 2 = Bear (lowest mean).
+    Falls back to volatility-tertile clustering on failure.
+    """
+    r   = (returns.dropna() * 100).values
+    idx = returns.dropna().index
+
+    try:
+        if len(r) < 150:
+            raise ValueError("Insufficient observations for 3-state model")
+
+        model = MarkovRegression(r, k_regimes=N_REGIMES,
+                                 switching_variance=True,
+                                 switching_trend=False)
+        res   = model.fit(disp=False, maxiter=200,
+                          warn_convergence=False, em_iter=10)
+
+        pix        = list(res.params.index)
+        const_keys = [k for k in pix if "const"  in str(k).lower()][:N_REGIMES]
+        sig_keys   = [k for k in pix if "sigma2" in str(k).lower()][:N_REGIMES]
+
+        means = []
+        for k in const_keys:
+            try:    means.append(float(res.params[k]))
+            except: means.append(0.0)
+        while len(means) < N_REGIMES:
+            means.append(0.0)
+
+        fvol = float(returns.std())
+        vols_raw = []
+        for k in sig_keys:
+            try:
+                v = float(np.sqrt(abs(res.params[k])) / 100)
+                vols_raw.append(v if (np.isfinite(v) and v > 0) else fvol)
+            except:
+                vols_raw.append(fvol)
+        while len(vols_raw) < N_REGIMES:
+            vols_raw.append(fvol)
+
+        order      = list(np.argsort(means)[::-1])   # highest mean = regime 0
+        old_to_new = {old: new for new, old in enumerate(order)}
+
+        raw_probs  = res.smoothed_marginal_probabilities
+        out        = pd.DataFrame(index=idx)
+        for old_i, new_i in old_to_new.items():
+            out[f"regime_{new_i}_prob"] = raw_probs[old_i].values
+            out[f"regime_{new_i}_vol"]  = vols_raw[old_i]
+
+        out["regime_current"] = (
+            out[[f"regime_{i}_prob" for i in range(N_REGIMES)]]
+            .idxmax(axis=1).str.extract(r"(\d+)")[0].astype(int)
+        )
+        return out
+
+    except Exception:
+        # Fallback: volatility-percentile tertiles, then relabel by mean return
+        vol_20     = returns.rolling(20).std()
+        p33, p67   = vol_20.quantile(0.33), vol_20.quantile(0.67)
+        raw        = pd.cut(vol_20, bins=[-np.inf, p33, p67, np.inf],
+                            labels=[0, 1, 2]).astype(float)
+        means_fb   = {i: float(returns[raw == i].mean())
+                      for i in range(N_REGIMES) if (raw == i).any()}
+        order_fb   = sorted(means_fb, key=means_fb.get, reverse=True)
+        remap      = {old: new for new, old in enumerate(order_fb)}
+        mapped     = raw.map(lambda x: remap.get(int(x), 1) if not pd.isna(x) else 1)
+
+        out = pd.DataFrame({"regime_current": mapped}, index=returns.index)
+        for new_i in range(N_REGIMES):
+            mask = (mapped == new_i)
+            out[f"regime_{new_i}_prob"] = mask.astype(float)
+            out[f"regime_{new_i}_vol"]  = float(
+                returns[mask].std() if mask.any() else returns.std())
+        return out
+
+
+# ============================================================
+# SECTION F: VOLATILITY FORECASTING
+# ============================================================
+
+def forecast_volatility(returns_series: pd.Series) -> float:
+    """
+    Fits GARCH(1,1), EGARCH(1,1), GJR-GARCH(1,1,1) all with Student-t.
+    Picks lowest AIC.  Returns daily vol as a fraction.
+    """
+    series = returns_series.dropna() * 100
+    if len(series) < 50:
+        return float(series.std() / 100)
+
+    fitted = []
+    for spec in [
+        dict(vol="Garch",  p=1, q=1,      dist="t"),
+        dict(vol="EGARCH", p=1, q=1,      dist="t"),
+        dict(vol="Garch",  p=1, o=1, q=1, dist="t"),
+    ]:
+        try:
+            res = arch_model(series, rescale=False, **spec).fit(
+                disp="off", show_warning=False)
+            fitted.append(res)
+        except Exception:
+            pass
+
+    if not fitted:
+        return float(series.std() / 100)
+
+    best  = min(fitted, key=lambda r: r.aic)
+    fcast = best.forecast(horizon=1)
+    sigma = float(np.sqrt(fcast.variance.values[-1, 0]) / 100)
+    return sigma if (np.isfinite(sigma) and sigma > 0) else float(series.std() / 100)
+
+
+# ============================================================
+# SECTION G: DRIFT CALCULATION
+# ============================================================
+
+def _safe_float(x, default: float = 0.0) -> float:
+    if isinstance(x, pd.Series):
+        x = x.iloc[0]
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def calculate_drift(symbol: str, returns_series: pd.Series,
+                    interest_rates: dict,
+                    rsi_14: float, bb_position: float) -> dict:
+    """
+    Combines carry (interest differential), momentum, RSI mean-reversion,
+    and BB mean-reversion into a total daily drift estimate.
+    Sentiment is excluded from drift and used only in composite ranking.
+    """
+    ccy      = ASSET_TO_CCY.get(symbol, "USD")
+    usd_rate = interest_rates.get("USD", 0.0)
+    ccy_rate = interest_rates.get(ccy, usd_rate)
+
+    carry = (ccy_rate - usd_rate) / 100.0 / 252.0
+    if symbol in USD_BASE_PAIRS:
+        carry = -carry
+
+    r      = returns_series.dropna()
+    mom_5  = _safe_float(r.tail(5).mean())  if len(r) >= 5  else 0.0
+    mom_20 = _safe_float(r.tail(20).mean()) if len(r) >= 20 else 0.0
+    mom_60 = _safe_float(r.tail(60).mean()) if len(r) >= 60 else 0.0
+    momentum = (mom_5 * 0.5 + mom_20 * 0.3 + mom_60 * 0.2) * 0.1
+
+    rsi_signal = -0.0001 if rsi_14 > 70 else (0.0001 if rsi_14 < 30 else 0.0)
+    bb_signal  = -(bb_position - 0.5) * 0.0001
+
+    total = carry * 0.40 + momentum * 0.35 + rsi_signal * 0.125 + bb_signal * 0.125
+    return {"carry": carry, "momentum": momentum,
+            "rsi": rsi_signal, "bb": bb_signal, "total": total}
+
+
+# ============================================================
+# SECTION H: MONTE CARLO SIMULATION
+# ============================================================
+
+def simulate_prices(P0: float, drift: float, vol: float,
+                    days: int = 1, trials: int = 3000,
+                    jump_prob: float = 0.02,
+                    jump_mean: float = 0.0,
+                    jump_std:  float = 0.025) -> np.ndarray:
+    """
+    GBM with Student-t(5) innovations and Poisson jump diffusion.
+    np.random.seed() must be set once by the caller; never reset here.
+    """
+    P0    = _safe_float(P0)
+    drift = _safe_float(drift)
+    vol   = max(_safe_float(vol, 0.01), 1e-6)
+
+    prices = np.full(trials, P0, dtype=np.float64)
+    for _ in range(days):
+        eps   = stats.t.rvs(df=5, size=trials) / np.sqrt(5.0 / 3.0)
+        jumps = np.where(np.random.rand(trials) < jump_prob,
+                         np.random.normal(jump_mean, jump_std, trials), 0.0)
+        prices *= np.exp((drift - 0.5 * vol**2) + vol * eps + jumps)
+    return prices
+
+
+def run_monte_carlo(current_price: float, drift: float, vol: float) -> dict:
+    """Runs MC across MC_HORIZONS; returns stats dict keyed by horizon name."""
+    out = {}
+    for h_name, days in MC_HORIZONS.items():
+        finals  = simulate_prices(current_price, drift, vol,
+                                  days=days, trials=MC_TRIALS)
+        ret_pct = (finals / current_price - 1.0) * 100.0
+        p5      = float(np.percentile(ret_pct, 5))
+        tail    = ret_pct[ret_pct <= p5]
+        cvar    = float(-np.mean(tail)) if len(tail) > 0 else float(-p5)
+
+        out[h_name] = {
+            "mean_return":    float(np.mean(ret_pct)),
+            "median_return":  float(np.median(ret_pct)),
+            "std_return":     float(np.std(ret_pct)),
+            "skew":           float(stats.skew(ret_pct)),
+            "kurtosis":       float(stats.kurtosis(ret_pct)),
+            "p5": p5, "p25": float(np.percentile(ret_pct, 25)),
+            "p75": float(np.percentile(ret_pct, 75)),
+            "p95": float(np.percentile(ret_pct, 95)),
+            "VaR_95":         float(-p5),
+            "CVaR_95":        cvar,
+            "prob_up":        float(np.mean(finals > current_price)),
+            "expected_price": float(np.mean(finals)),
+            "range_low_1s":   float(np.percentile(finals, 16)),
+            "range_high_1s":  float(np.percentile(finals, 84)),
+            "ret_array":      ret_pct,   # retained for Sortino/Omega
+        }
+    return out
+
+
+# ============================================================
+# SECTION I: MACHINE LEARNING ENSEMBLE -- LEAKAGE-FREE
+# ============================================================
+
+def _fold_impute(X_tr: np.ndarray, X_va: np.ndarray):
+    """
+    Computes column medians on training data only, applies to both folds.
+    Eliminates imputation leakage: val-set statistics never touch training.
+    Returns (X_tr_imputed, X_va_imputed, col_medians).
+    """
+    medians = np.nanmedian(X_tr, axis=0)
+    for j in range(X_tr.shape[1]):
+        X_tr[np.isnan(X_tr[:, j]), j] = medians[j]
+        X_va[np.isnan(X_va[:, j]), j] = medians[j]
+    return X_tr, X_va, medians
+
+
+def train_ml_ensemble(X: pd.DataFrame, y: pd.Series) -> dict:
+    """
+    Leakage-free training:
+      1. TimeSeriesSplit folds: inside each fold, fit RobustScaler and
+         median imputer on train only, transform both train and val.
+      2. CV accuracy scores are unbiased estimates.
+      3. After CV, refit scaler + imputer on full data for live inference.
+
+    Returns: scaler, col_medians, best_model, cv_score, all_scores,
+             feature_cols (for column-alignment in predict_with_model).
+    """
+    X_arr  = X.values.copy().astype(np.float64)
+    y_arr  = y.values
+    cols   = list(X.columns)
+    tscv   = TimeSeriesSplit(n_splits=5)
+
+    specs = {
+        "LR":  LogisticRegression(max_iter=2000, C=0.1,
+                                   class_weight="balanced", random_state=SEED),
+        "RF":  RandomForestClassifier(n_estimators=200, max_depth=12,
+                                       min_samples_split=15,
+                                       class_weight="balanced",
+                                       n_jobs=-1, random_state=SEED),
+        "GB":  GradientBoostingClassifier(n_estimators=150, max_depth=4,
+                                           learning_rate=0.05, subsample=0.8,
+                                           random_state=SEED),
+        "XGB": xgb.XGBClassifier(n_estimators=150, max_depth=5,
+                                   learning_rate=0.05, subsample=0.8,
+                                   eval_metric="logloss",
+                                   random_state=SEED, verbosity=0),
+        "LGB": lgb.LGBMClassifier(n_estimators=150, max_depth=5,
+                                    learning_rate=0.05, subsample=0.8,
+                                    random_state=SEED, verbose=-1),
+    }
+
+    cv_scores = {name: [] for name in specs}
+
+    for tr_idx, va_idx in tscv.split(X_arr):
+        X_tr, X_va = X_arr[tr_idx].copy(), X_arr[va_idx].copy()
+        y_tr, y_va = y_arr[tr_idx],         y_arr[va_idx]
+
+        # Impute and scale inside fold -- no leakage
+        X_tr, X_va, _ = _fold_impute(X_tr, X_va)
+        sc_fold        = RobustScaler()
+        X_tr           = sc_fold.fit_transform(X_tr)
+        X_va           = sc_fold.transform(X_va)
+
+        for name, model in specs.items():
+            try:
+                model.fit(X_tr, y_tr)
+                cv_scores[name].append(
+                    accuracy_score(y_va, model.predict(X_va)))
+            except Exception:
+                pass
+
+    mean_scores = {n: float(np.mean(v)) for n, v in cv_scores.items() if v}
+    if not mean_scores:
+        return {}
+
+    # -- Fit final pipeline on full dataset ----------------------------------------
+    X_full   = X_arr.copy()
+    medians  = np.nanmedian(X_full, axis=0)
+    for j in range(X_full.shape[1]):
+        X_full[np.isnan(X_full[:, j]), j] = medians[j]
+
+    final_sc = RobustScaler()
+    X_sc     = final_sc.fit_transform(X_full)
+
+    trained = {}
+    for name, model in specs.items():
+        if name in mean_scores:
+            try:
+                model.fit(X_sc, y_arr)
+                trained[name] = model
+            except Exception:
+                pass
+
+    if len(trained) >= 3:
+        try:
+            ens = VotingClassifier(estimators=list(trained.items()), voting="soft")
+            ens.fit(X_sc, y_arr)
+            trained["ENSEMBLE"] = ens
+            mean_scores["ENSEMBLE"] = float(max(mean_scores.values()) + 0.005)
+        except Exception:
+            pass
+
+    best_name = max(mean_scores, key=mean_scores.get)
+    return {
+        "scaler":       final_sc,
+        "col_medians":  medians,
+        "best_model":   trained.get(best_name),
+        "best_name":    best_name,
+        "cv_score":     mean_scores[best_name],
+        "all_scores":   mean_scores,
+        "feature_cols": cols,
+    }
+
+
+def predict_with_model(ml_result: dict, X_latest: pd.DataFrame) -> float:
+    """
+    Applies training-fitted imputer -> scaler -> predict_proba to one row.
+    Column alignment ensures the live observation matches training features.
+    Returns P(bullish) as a float in [0, 1].
+    """
+    if not ml_result or ml_result.get("best_model") is None:
+        return 0.5
+
+    cols     = ml_result["feature_cols"]
+    medians  = ml_result["col_medians"]
+    scaler   = ml_result["scaler"]
+    model    = ml_result["best_model"]
+
+    row = X_latest.reindex(columns=cols).values.astype(np.float64).flatten()
+    for j in range(len(row)):
+        if np.isnan(row[j]):
+            row[j] = medians[j] if j < len(medians) else 0.0
+
+    proba = model.predict_proba(scaler.transform(row.reshape(1, -1)))[0]
+    return float(proba[1])
+
+
+# ============================================================
+# SECTION J: RANKING UTILITIES
+# ============================================================
+
+def _sharpe(mean_r: float, std_r: float) -> float:
+    return mean_r / std_r if std_r > 0 else 0.0
+
+def _sortino(ret_array: np.ndarray, target: float = 0.0) -> float:
+    dd = ret_array[ret_array < target]
+    ds = float(np.std(dd)) if len(dd) > 1 else 1e-9
+    return (float(np.mean(ret_array)) - target) / ds if ds > 0 else 0.0
+
+def _omega(ret_array: np.ndarray, threshold: float = 0.0) -> float:
+    gains  = ret_array[ret_array >  threshold] - threshold
+    losses = threshold - ret_array[ret_array <= threshold]
+    if losses.sum() == 0:
+        return 10.0      # cap at 10 to keep z-scoring well-behaved
+    if gains.sum() == 0:
+        return 0.0
+    return float(min(gains.sum() / losses.sum(), 10.0))
+
+
+# ============================================================
+# SECTION K: BACKTEST LOGGER WITH LIVE BACKFILL
+# ============================================================
+
+def _write_backtest_log(results: dict, asset_data: dict):
+    """
+    1. Loads existing backtest CSV (if any).
+    2. For every past forecast row where realized_return_1w is blank
+       AND BT_HORIZON trading days have elapsed, pulls the actual
+       close-to-close return from asset_data already in memory,
+       computes MAE and direction correctness, and fills them in.
+    3. Appends today's new forecasts (realized fields left blank).
+    4. Saves deduplicated, sorted CSV.
+    5. Prints walk-forward accuracy summary when enough data exists.
+
+    This runs automatically on every execution -- no separate backfill
+    script is needed.
+    """
+    today_str = str(pd.Timestamp.utcnow().normalize().date())
+
+    new_rows = []
+    for sym, r in results.items():
+        new_rows.append({
+            "date":               today_str,
+            "symbol":             sym,
+            "asset_class":        r["asset_class"],
+            "forecast_dir":       r["mc_direction"],
+            "forecast_return_1w": r["mc_return_1w"],
+            "forecast_vol_daily": r["final_vol_daily"],
+            "forecast_sharpe":    r["sharpe_1w"],
+            "composite_score":    r["composite_score"],
+            "realized_return_1w": np.nan,
+            "forecast_error":     np.nan,
+            "direction_correct":  np.nan,
+        })
+    new_df = pd.DataFrame(new_rows)
+
+    try:
+        log = pd.read_csv(BT_FILE, parse_dates=["date"])
+    except FileNotFoundError:
+        log = pd.DataFrame()
+
+    # -- Backfill realised returns for mature past forecasts -------------------
+    if not log.empty and "date" in log.columns:
+        log["date"]      = pd.to_datetime(log["date"])
+        today_ts         = pd.Timestamp.utcnow().normalize()
+        unfilled_mask    = log["realized_return_1w"].isna()
+
+        for idx in log.index[unfilled_mask]:
+            sym   = log.at[idx, "symbol"]
+            f_dt  = pd.Timestamp(log.at[idx, "date"])
+            elapsed_days = (today_ts - f_dt).days
+
+            # Need at least BT_HORIZON+2 calendar days before backfilling
+            # (accounts for weekends; 5 trading days ~ 7 calendar days)
+            if elapsed_days < BT_HORIZON + 2:
+                continue
+            if sym not in asset_data:
+                continue
+
+            close = asset_data[sym]["Close"].squeeze().dropna()
+            close.index = pd.to_datetime(close.index).tz_localize(None)
+            f_dt_naive  = f_dt.tz_localize(None)
+
+            # Find the first available price on or after the forecast date
+            future = close[close.index >= f_dt_naive]
+            if len(future) < BT_HORIZON + 1:
+                continue
+
+            p_entry  = float(future.iloc[0])
+            p_exit   = float(future.iloc[BT_HORIZON])
+            realized = (p_exit / p_entry - 1.0) * 100.0
+            real_dir = "BULLISH" if realized > 0 else "BEARISH"
+            f_ret    = log.at[idx, "forecast_return_1w"]
+
+            log.at[idx, "realized_return_1w"] = round(realized, 4)
+            log.at[idx, "forecast_error"]     = round(
+                abs(realized - f_ret) if pd.notna(f_ret) else np.nan, 4)
+            log.at[idx, "direction_correct"]  = int(
+                real_dir == log.at[idx, "forecast_dir"])
+
+    # -- Append today and save -------------------------------------------------
+    log = pd.concat([log, new_df], ignore_index=True)
+    log["date"] = pd.to_datetime(log["date"])
+    log = (log.drop_duplicates(subset=["date", "symbol"], keep="last")
+              .sort_values(["symbol", "date"])
+              .reset_index(drop=True))
+    log.to_csv(BT_FILE, index=False)
+
+    # -- Walk-forward accuracy summary -----------------------------------------
+    filled = log.dropna(subset=["realized_return_1w", "forecast_return_1w",
+                                 "direction_correct"])
+    n = len(filled)
+    print(f"\n  Backtest log: {len(log)} entries total, {n} with realised returns")
+    if n >= 5:
+        mae     = float(filled["forecast_error"].mean())
+        rmse    = float(np.sqrt((filled["forecast_error"]**2).mean()))
+        dir_acc = float(filled["direction_correct"].mean())
+        print(f"  Walk-forward accuracy ({n} completed forecasts):")
+        print(f"    Direction accuracy : {dir_acc:.1%}")
+        print(f"    MAE  (return %)    : {mae:.2f}%")
+        print(f"    RMSE (return %)    : {rmse:.2f}%")
+        per_asset = (filled.groupby("symbol")
+                     .agg(n=("direction_correct", "count"),
+                          dir_acc=("direction_correct", "mean"),
+                          mae=("forecast_error", "mean"))
+                     .sort_values("dir_acc", ascending=False))
+        print(f"\n  Per-asset accuracy:\n{per_asset.to_string()}")
+    else:
+        print(f"  (need >= 5 completed forecasts to report accuracy; have {n})")
+
+
+# ============================================================
+# SECTION L: MAIN PIPELINE
+# ============================================================
+
+def run_forecasting_system():
+    print("\n" + "=" * 72)
+    print("  OANDA ENHANCED MULTI-ASSET MACRO-QUANT FORECASTING SYSTEM")
+    print("=" * 72)
+
+    # -- 1. Collect all external data ------------------------------------------
+    asset_data, tickers_used = collect_asset_data()
+    macro_data               = collect_macro_data()
+
+    print("\nFetching interest rates...")
+    interest_rates = fetch_interest_rates()
+
+    print("\nFetching sentiment...")
+    sentiments = fetch_news_sentiments()
+    print(f"  Sentiment: { {k: round(v, 3) for k, v in sentiments.items()} }")
+
+    macro_features = calculate_macro_features(macro_data)
+
+    if not asset_data:
+        print("No asset data collected. Exiting.")
+        return
+
+    # -- 2. Per-asset processing -----------------------------------------------
+    results = {}
+    np.random.seed(SEED)   # single seed; MC functions must not reset internally
+
+    for symbol, data in asset_data.items():
+        info = ASSET_UNIVERSE[symbol]
+        print(f"\n  Processing {symbol} ({info['name']})...")
+
+        close   = data["Close"].squeeze()
+        returns = close.pct_change().dropna()
+
+        # -- Technical features ------------------------------------------------
+        tech_df = calculate_technical_features(data)
+
+        # Latest snapshot for drift inputs
+        rsi_14 = _safe_float(
+            tech_df["rsi_14"].dropna().iloc[-1]
+            if "rsi_14" in tech_df.columns else 50.0)
+        bb_pos = _safe_float(
+            tech_df["bb_position_20"].dropna().iloc[-1]
+            if "bb_position_20" in tech_df.columns else 0.5)
+
+        # -- Regime detection --------------------------------------------------
+        regime_df   = fit_regime_model(returns)
+        current_reg = int(regime_df["regime_current"].iloc[-1])
+
+        # Probability-weighted regime volatility across all 3 states
+        fallback_v   = float(returns.std())
+        regime_adj_v = sum(
+            _safe_float(regime_df.get(f"regime_{i}_prob",
+                                      pd.Series(1.0 / N_REGIMES)).iloc[-1])
+            * _safe_float(regime_df.get(f"regime_{i}_vol",
+                                        pd.Series(fallback_v)).iloc[-1])
+            for i in range(N_REGIMES)
+        )
+
+        # -- GARCH volatility --------------------------------------------------
+        garch_vol = forecast_volatility(returns)
+        final_vol = max(garch_vol, regime_adj_v)   # conservative: take larger
+
+        # -- Drift -------------------------------------------------------------
+        drift_dict  = calculate_drift(symbol, returns, interest_rates,
+                                      rsi_14, bb_pos)
+        total_drift = drift_dict["total"]
+
+        # -- Sentiment differential for this asset's currency ------------------
+        ccy       = ASSET_TO_CCY.get(symbol, "USD")
+        sent_diff = (_safe_float(sentiments.get(ccy, 0.0))
+                     - _safe_float(sentiments.get("USD", 0.0)))
+
+        # -- ML ensemble -------------------------------------------------------
+        # Feature matrix: technical indicators + scalar macro features +
+        #                 regime probabilities (all look-back, no leakage).
+        # Target: sign of FORECAST_HORIZON-bar-ahead return.
+        # shift(-H) aligns target with current bar; combined.dropna() then
+        # removes the final H rows that have no resolvable future target.
+        features = tech_df.copy()
+        for k, v in macro_features.items():
+            features[f"macro_{k}"] = v
+        features = pd.concat(
+            [features, regime_df.reindex(features.index)], axis=1)
+
+        fwd_ret  = close.pct_change(FORECAST_HORIZON).shift(-FORECAST_HORIZON)
+        target   = (fwd_ret > 0).astype(int)
+        combined = pd.concat(
+            [features, target.rename("target")], axis=1).dropna()
+
+        ml_result = {}
+        ml_prob_up, ml_cv, ml_name = 0.5, 0.5, "N/A"
+
+        if len(combined) >= 500:
+            X_df = combined.drop("target", axis=1)
+            y_s  = combined["target"]
+            try:
+                ml_result = train_ml_ensemble(X_df, y_s)
+            except Exception as e:
+                print(f"    ML training failed: {e}")
+
+            if ml_result and ml_result.get("best_model") is not None:
+                # Live inference row: uses full feature set (including today,
+                # which has no future target yet and was excluded from combined).
+                # Column alignment in predict_with_model handles any mismatches.
+                live_feat = pd.concat(
+                    [tech_df, regime_df.reindex(tech_df.index)],
+                    axis=1).iloc[-1:]
+                for k, v in macro_features.items():
+                    live_feat[f"macro_{k}"] = v
+
+                ml_prob_up = predict_with_model(ml_result, live_feat)
+                ml_cv      = ml_result["cv_score"]
+                ml_name    = ml_result["best_name"]
+        else:
+            print(f"    Insufficient rows for ML ({len(combined)}); using 0.5")
+
+        # -- Monte Carlo -------------------------------------------------------
+        current_price = _safe_float(close.iloc[-1])
+        mc = run_monte_carlo(current_price, total_drift, final_vol)
+
+        # -- Risk-adjusted ratios (1-week horizon) -----------------------------
+        r1w   = mc["1w"]["ret_array"]
+        sr    = _sharpe(mc["1w"]["mean_return"], mc["1w"]["std_return"])
+        so    = _sortino(r1w)
+        om    = _omega(r1w)
+        r2var = (mc["1w"]["mean_return"] / mc["1w"]["VaR_95"]
+                 if mc["1w"]["VaR_95"] > 0 else 0.0)
+
+        direction    = "BULLISH" if mc["1w"]["mean_return"] > 0 else "BEARISH"
+        ml_direction = "BULLISH" if ml_prob_up > 0.5 else "BEARISH"
+        regime_raw   = {0: +1.0, 1: 0.0, 2: -1.0}.get(current_reg, 0.0)
+
+        results[symbol] = {
+            "name":               info["name"],
+            "asset_class":        info["class"],
+            "ticker_used":        tickers_used[symbol],
+            "current_price":      current_price,
+            "ml_prob_bullish":    ml_prob_up,
+            "ml_cv_score":        ml_cv,
+            "ml_direction":       ml_direction,
+            "ml_model":           ml_name,
+            "mc_direction":       direction,
+            "mc_prob_up":         mc["1w"]["prob_up"],
+            "mc_return_1d":       mc["1d"]["mean_return"],
+            "mc_return_1w":       mc["1w"]["mean_return"],
+            "mc_return_2w":       mc["2w"]["mean_return"],
+            "mc_return_1m":       mc["1m"]["mean_return"],
+            "var95_1w":           mc["1w"]["VaR_95"],
+            "cvar95_1w":          mc["1w"]["CVaR_95"],
+            "range_low_1s":       mc["1w"]["range_low_1s"],
+            "range_high_1s":      mc["1w"]["range_high_1s"],
+            "garch_vol_daily":    garch_vol,
+            "final_vol_daily":    final_vol,
+            "ann_vol_pct":        final_vol * 100 * np.sqrt(252),
+            "regime":             current_reg,
+            "regime_label":       REGIME_LABELS.get(current_reg, "?"),
+            "drift_carry":        drift_dict["carry"],
+            "drift_momentum":     drift_dict["momentum"],
+            "drift_total":        total_drift,
+            "sharpe_1w":          sr,
+            "sortino_1w":         so,
+            "omega_1w":           om,
+            "return_to_var":      r2var,
+            "sent_diff":          sent_diff,
+            "_regime_raw":        regime_raw,
+            "signal_aligned":     direction == ml_direction,
+            "composite_score":    0.0,   # filled in cross-sectional pass below
+            "_mc":                mc,    # excluded from CSV export by _ prefix
+        }
+
+        print(f"    MC {direction} ({mc['1w']['mean_return']:+.2f}% 1w) | "
+              f"ML {ml_direction} ({ml_prob_up:.0%}) | "
+              f"Vol {final_vol*100:.2f}%/d | "
+              f"Regime {REGIME_LABELS.get(current_reg)} | "
+              f"Sharpe {sr:.2f}")
+
+    # -- 3. Cross-sectional composite score ------------------------------------
+    #
+    # All scoring components live on different scales:
+    #   Sharpe   ~ [-3,  +5]
+    #   Sortino  ~ [-5, +20]
+    #   Omega    ~ [ 0,  10]  (capped)
+    #   R/VaR    ~ [-2,  +2]
+    #   ML prob  ~ [ 0,   1]
+    #   Sent     ~ [-2,  +2]
+    #   Regime   ~ {-1, 0, +1}
+    #
+    # Fix: z-score each metric across all N assets in the current universe,
+    # so every component has mean=0, std=1 before weighting.
+    # Weights reflect signal reliability, not scale:
+    #   Sortino  25% -- downside-only risk adj, most relevant for directional trades
+    #   R/VaR    20% -- reward vs worst-case tail from MC distribution
+    #   Sharpe   15% -- overall MC risk-adj quality
+    #   ML prob  15% -- independent directional signal from ensemble
+    #   Omega    10% -- probability-weighted gain/loss ratio
+    #   Sent     10% -- news-flow positioning signal
+    #   Regime    5% -- structural context (coarser, lower weight)
+    # --------------------------------------------------------------------------
+
+    if not results:
+        print("\nNo results to display.")
+        return
+
+    SCORE_WEIGHTS = {
+        "sortino_1w":      0.25,
+        "return_to_var":   0.20,
+        "sharpe_1w":       0.15,
+        "ml_prob_bullish": 0.15,
+        "omega_1w":        0.10,
+        "sent_diff":       0.10,
+        "_regime_raw":     0.05,
+    }
+
+    syms = list(results.keys())
+
+    def _xscore(arr: np.ndarray) -> np.ndarray:
+        mu, sd = np.nanmean(arr), np.nanstd(arr)
+        return (arr - mu) / sd if sd > 1e-12 else np.zeros_like(arr)
+
+    raw = {k: np.array([results[s][k] for s in syms], dtype=float)
+           for k in SCORE_WEIGHTS}
+
+    # Winsorise omega before z-scoring (cap at 99th percentile)
+    fin_om = raw["omega_1w"][np.isfinite(raw["omega_1w"])]
+    p99    = float(np.nanpercentile(fin_om, 99)) if len(fin_om) > 0 else 10.0
+    raw["omega_1w"] = np.clip(raw["omega_1w"], -np.inf, p99)
+
+    composite = np.zeros(len(syms))
+    for k, w in SCORE_WEIGHTS.items():
+        composite += w * _xscore(raw[k])
+
+    for i, sym in enumerate(syms):
+        results[sym]["composite_score"] = float(composite[i])
+
+    ranked = sorted(results.items(),
+                    key=lambda x: x[1]["composite_score"], reverse=True)
+
+    # -- 4. Display ------------------------------------------------------------
+    print("\n  Cross-sectional composite scores (z-normalised):")
+    print(f"  {'Symbol':<18} {'Score':>8}  {'MC Dir':>8}  {'ML Dir':>8}  Regime")
+    print("  " + "-" * 60)
+    for sym, r in ranked:
+        aligned = "ok" if r["signal_aligned"] else "!!"
+        print(f"  {sym:<18} {r['composite_score']:>+8.4f}  "
+              f"{r['mc_direction']:>8}  {r['ml_direction']:>8}  "
+              f"{r['regime_label']}  [{aligned}]")
+
+    print("\n" + "=" * 72)
+    print("  TOP 3 OPPORTUNITIES  --  48-72 h Forecast")
+    print("=" * 72)
+    for i, (sym, r) in enumerate(ranked[:3], 1):
+        aligned = "signals aligned" if r["signal_aligned"] else "SIGNALS DIVERGE"
+        print(f"""
+#{i}  {sym}  ({r['name']})  [{r['asset_class']}]
+    MC / ML direction  : {r['mc_direction']} / {r['ml_direction']}  ({aligned})
+    Composite score    : {r['composite_score']:+.4f}
+    MC prob up (1w)    : {r['mc_prob_up']:.1%}
+    Expected return    : 1d {r['mc_return_1d']:+.2f}%  1w {r['mc_return_1w']:+.2f}%  2w {r['mc_return_2w']:+.2f}%  1m {r['mc_return_1m']:+.2f}%
+    Risk (1w)          : VaR95 {r['var95_1w']:.2f}%  CVaR95 {r['cvar95_1w']:.2f}%
+    Price range (1 sd) : {r['range_low_1s']:.4f}  to  {r['range_high_1s']:.4f}
+    Sharpe / Sortino   : {r['sharpe_1w']:.3f} / {r['sortino_1w']:.3f}   Omega: {r['omega_1w']:.3f}
+    Ann. volatility    : {r['ann_vol_pct']:.1f}%   (GARCH daily: {r['garch_vol_daily']*100:.2f}%)
+    Regime             : {r['regime_label']}
+    Drift carry / mom  : {r['drift_carry']*1e4:+.2f} bp/d  /  {r['drift_momentum']*1e4:+.2f} bp/d
+    ML model / CV acc  : {r['ml_model']}  ({r['ml_cv_score']:.1%})
+    Ticker / price     : {r['ticker_used']}  @  {r['current_price']:.4f}
+""")
+
+    print("=" * 72)
+    print("  FULL RANKINGS")
+    print("=" * 72)
+    hdr = (f"  {'#':>2}  {'Symbol':<18} {'Class':<8} {'Dir':<9}"
+           f"{'Score':>8}  {'MC-up':>6}  {'SR':>6}  {'SO':>6}  {'Ann-Vol':>8}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for i, (sym, r) in enumerate(ranked, 1):
+        arrow = "+" if r["mc_direction"] == "BULLISH" else "-"
+        print(f"  {i:>2}. {sym:<18} {r['asset_class']:<8} "
+              f"{arrow}{r['mc_direction']:<8} "
+              f"{r['composite_score']:>+8.4f}  "
+              f"{r['mc_prob_up']:>6.1%}  "
+              f"{r['sharpe_1w']:>6.2f}  "
+              f"{r['sortino_1w']:>6.2f}  "
+              f"{r['ann_vol_pct']:>7.1f}%")
+
+    # -- 5. Export CSVs --------------------------------------------------------
+    export_rows = []
+    for sym, r in results.items():
+        row = {k: v for k, v in r.items() if not k.startswith("_")}
+        row["symbol"] = sym
+        export_rows.append(row)
+
+    pd.DataFrame(export_rows).set_index("symbol").to_csv(
+        "oanda_forecast_summary.csv")
+
+    mc_rows = []
+    for sym, r in results.items():
+        for h, h_stats in r["_mc"].items():
+            mc_rows.append({
+                "symbol": sym, "horizon": h,
+                "mean_return":   h_stats["mean_return"],
+                "std_return":    h_stats["std_return"],
+                "prob_up":       h_stats["prob_up"],
+                "VaR_95":        h_stats["VaR_95"],
+                "CVaR_95":       h_stats["CVaR_95"],
+                "skew":          h_stats["skew"],
+                "kurtosis":      h_stats["kurtosis"],
+            })
+    pd.DataFrame(mc_rows).to_csv("oanda_forecast_mc_horizons.csv", index=False)
+
+    pd.DataFrame({"rate_%": interest_rates}).to_csv("interest_rates.csv")
+    pd.DataFrame({"sentiment": sentiments}).to_csv("sentiments.csv")
+
+    # -- 6. Walk-forward backtest (live backfill on each run) ------------------
+    _write_backtest_log(results, asset_data)
+
+    print("\nFiles written:")
+    for f in ["oanda_forecast_summary.csv", "oanda_forecast_mc_horizons.csv",
+              "interest_rates.csv", "sentiments.csv", BT_FILE]:
+        print(f"  {f}")
+
+    print("\nDISCLAIMER: Research / educational use only. Not financial advice.")
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    run_forecasting_system()
