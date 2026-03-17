@@ -1,65 +1,84 @@
-Forex and DXY Modelling
+# forex-and-dxy-modelling
 
-This repository contains a set of Python notebooks and scripts for cross‑sectional currency pair selection and short‑horizon DXY (U.S. Dollar Index) directional forecasting. The codebase aims to be an end‑to‑end research toolkit rather than a ready‑to‑trade system: it fetches public market data, performs regime‑aware volatility and drift estimation, runs Monte‑Carlo simulations, scores currencies and renders diagnostic reports. It is designed for reproducible research – JSON/CSV snapshots are written to disk and important decisions (e.g., choice of volatility model) are logged.
+This repository contains two complementary models: (i) an FX cross-section engine for **currency-pair selection**, and (ii) a **short-horizon directional model** for the U.S. Dollar Index (**DXY**). The framework integrates regime-aware volatility estimation, dimensionality reduction, Monte Carlo simulation, event filters, and sentiment analysis. It is designed for transparent diagnostics and reproducible research.
 
-⚠️ Disclaimer: This project is provided for research and educational purposes only. It does not constitute financial advice and should not be used to make live trading decisions.
+---
 
-Repository contents
-Script/Notebook	Purpose & key features
-pair_selection_forex 6 pairs.py	Implements a currency‑pair selection engine covering six major currencies (USD, EUR, GBP, JPY, CAD, CHF). It downloads spot FX prices from Yahoo Finance, computes realised and forecast volatility (GARCH/EGARCH/GJR‑GARCH with fallback to realised volatility), applies business‑day alignment, constructs a synthetic USD basket, and calculates drift components from momentum, sentiment (VADER on FXStreet RSS), interest‑rate differentials and macro events. An extensive Monte‑Carlo module simulates 1‑day/1‑week/1‑month horizons using regime‑weighted volatility and event boosts. Currencies are ranked on a composite score (Sharpe, Sortino, Omega, return-to‑VaR and volatility‑adjusted return). Numerous CSV outputs – returns_winsorized.csv, volatility_forecasts.csv, sim_results_*.csv, pair_rankings_comprehensive.csv, etc. – enable post‑analysis.
-dxy_directional_model.py	Produces a Bullish/Bearish/Neutral call for the U.S. Dollar Index over a 1–3 day horizon. It fetches five years of DXY data, calculates a 14‑day average daily range and a 10‑/50‑day volatility ratio, performs PCA on correlated markets (gold, VIX, S&P 500) to capture a risk‑on/off factor, detects “liquidity sweeps” (single‑leg breaks of the previous day’s high/low), fits a GARCH(1,1) model to forecast next‑day volatility, scrapes Google News headlines for sentiment via VADER, and runs a simple Monte‑Carlo simulation without technical drift. Votes from liquidity sweeps, news sentiment, PCA and Monte‑Carlo tilt the forecast.
-Macroeconomic 8 pairs 1 month max	An enhanced FX forecasting notebook covering eight currencies (adds AUD & NZD). It significantly expands the pipeline: it builds a synthetic DXY basket with seven legs, applies Markov‑switching (2‑state) regime detection on log‑returns, performs multi‑model volatility forecasting (GARCH, EGARCH, GJR‑GARCH) and chooses the best model by AIC. Macro data is scraped from TradingEconomics (interest rates, GDP growth, inflation) with 403‑safe fallbacks and from ForexFactory for event calendars. Sentiment is derived from FXStreet RSS, and technical indicators (momentum, RSI, Bollinger position, ADX proxy) are computed. Drifts are assembled from carry, macro fundamentals, sentiment and technical factors with tunable weights. Price paths are simulated via a jump‑diffusion GBM with fat tails and rare jumps. The notebook ranks currency pairs on multiple risk metrics, tracks forecast accuracy, outputs correlation/PCA diagnostics and suggests risk‑management parameters.
-Other notebooks (Macroeconomic Indicators 8 pairs, Multi‑Asset 2nd Edition, etc.)	Variants of the enhanced model that experiment with different features (e.g., different macro indicator sets, asset universes or forecast horizons). They follow the same template: download data, perform volatility and regime analysis, compute drift signals, run Monte‑Carlo simulations and produce rankings and reports.
-README.md	High‑level overview of the two models, their data sources and methodological components.
-Quick start
+## 1. Forex Pair Selection Model
 
-Because the notebooks/scripts rely on live data and third‑party libraries, running them requires an up‑to‑date Python environment. A typical workflow to reproduce the core models is:
+This model ranks currencies by structural context, volatility regime, and cross-sectional divergence to identify asymmetric opportunities. The methodology combines market-microstructure heuristics with robust statistical filtering.
 
-Clone the repository:
+### 1.1 Data Sources
+- Spot FX and proxies via Yahoo Finance (`auto_adjust=False`) to preserve raw price dynamics (e.g., `EURUSD=X`, `GBPUSD=X`, `USDJPY=X`; `DX-Y.NYB` / `UUP` for USD).
+- Optional currency futures (e.g., 6E, 6B, 6J) where available.
+- A synthetic DXY-like USD basket constructed from major legs for diagnostic comparison.
 
-git clone https://github.com/LukeFX-445/forex-and-dxy-modelling.git
-cd forex-and-dxy-modelling
+### 1.2 Volatility Filtering
+- **Average Daily Range (ADR)** using **True Range ADR(14)** and **ADR%** (ADR divided by level) for scale-free comparisons.
+- **Realised volatility comparators**: **Parkinson** estimator (10-day) and **EWMA** (20-day).
+- **Conditional volatility models**: **GARCH(1,1)**, **EGARCH**, and **GJR-GARCH** with **Student-t** innovations (`rescale=False`). Model selection uses **AIC**; if fitting fails, a **local realised σ** fallback maintains continuity.
 
-Install dependencies. The scripts install packages at runtime via pip, but you can pre‑install them for speed:
+### 1.3 Directional Filtering
+- Regime awareness: signal weights adapt to volatility state (e.g., ADR expansion and an elevated 10/50-day vol-ratio increase emphasis on trend-following evidence).
 
-python -m pip install --upgrade yfinance pandas numpy scikit-learn statsmodels arch investpy feedparser vaderSentiment beautifulsoup4 lxml html5lib fredapi scipy
+### 1.4 Dimensionality Reduction
+- **PCA** on standardised daily returns (and ADR-normalised moves) to extract common risk factors.
+- Outlier screening on **loadings** flags currencies that are misaligned or lagging relative to the cross-section.
+- Sanity checks compare **PC1** to USD proxies (DXY/UUP and the synthetic basket).
 
-Run the DXY directional model:
+### 1.5 Monte Carlo Simulation
+Forward paths are simulated under a geometric Brownian motion (GBM) with model-implied drift and volatility. Scenarios incorporate volatility shocks, carry differentials, and event-week boosts to σ. Outputs include expected-move bands, percentiles, VaR(95%), and ES(95%).
 
-python dxy_directional_model.py
+### 1.6 Sentiment Analysis
+- RSS headlines are parsed with **VADER**; a light central-bank lexicon (Fed, ECB, BoE, BoJ, BoC, SNB) aids context.
+- Sentiment scores are cross-validated against recent price action and PCA-derived risk to confirm or challenge directional hypotheses.
 
-The script prints diagnostic information (latest ADR, PCA loadings, liquidity sweep flags, forecast volatility) and ends with a direction call and confidence percentage.
+---
 
-Run the pair‑selection engine:
+## 2. USD Index (DXY) Directional Model
 
-python "pair_selection_forex 6 pairs.py"
+This model produces a 1–3 day **Bullish / Bearish / Neutral** call for DXY with an associated **confidence** and **expected range**. It merges technical structure, volatility regime, macro events, and text sentiment.
 
-This script takes several minutes due to data downloads and multiple GARCH fits. Outputs (CSV files) will appear in the working directory. See pair_rankings_comprehensive.csv for a summary table of expected returns, risk metrics and composite scores.
+### 2.1 Technical Structure
+- **Liquidity sweeps**: sessions that take out only the previous day’s high (bearish risk) or only the previous day’s low (bullish risk).
+- **Trend filter**: EMA(21/50) spread and slope; alignment with ADR expansion increases conviction.
+- **Level context**: proximity to the prior week’s extremal range and evidence of displacement from key levels.
 
-Explore the enhanced macro notebook. For the Macroeconomic 8 pairs 1 month max and related notebooks, we recommend using Jupyter:
+### 2.2 Volatility Estimation
+- **TR-ADR(14)** and **ADR%** for intraday range context.
+- **Parkinson (10-day)** and **EWMA(20)** realised volatility for regime classification.
+- **GARCH family** (GARCH/EGARCH/GJR-GARCH, Student-t, `rescale=False`) to forecast **next-day σ**; the **AIC-optimal** model is selected with a robust fallback to local realised σ.
+- **10/50-day vol-ratio** to detect transitions between compression and expansion regimes.
 
-jupyter notebook
-# open the notebook in your browser
+### 2.3 Event Filters
+- High-impact macro events (e.g., **NFP**, **CPI**, **FOMC**, real yields) **upweight volatility** and may **nudge drift**.
+- Calendars fetched with redundancy (investpy plus **ForexFactory JSON/HTML** fallback).
+- **Interest-rate carry** derived from TradingEconomics with 403-safe headers; a ForexFactory fallback is provided. Carry acts as a proxy drift versus the G5 basket.
 
-These notebooks contain extensive printouts and generate numerous CSV/JSON files documenting regimes, volatility forecasts, drift components, simulations, rankings and accuracy metrics.
+### 2.4 Sentiment Filters
+- **DXY/USD news sentiment** via VADER on curated headlines.
+- A **Fed-focused** slice approximates policy tone (hawkish/dovish), which receives greater weight around policy events.
+- A **risk-proxy PCA** using **[DXY, Gold, VIX, SPX]** (standardised). The sign of PC1 relative to DXY provides a risk-on/risk-off vote.
 
-Methodological highlights
+### 2.5 Probability and Scoring
+- Each factor contributes a vote in `{−1, 0, +1}` with tunable weights (e.g., trend, PCA vote, liquidity sweep, sentiment—broad and Fed-specific—Monte-Carlo up-probability, ADR expansion, 10/50 vol-ratio, proximity/level tests).
+- The final **directional score** is the weighted sum, mapped to **confidence buckets**. Weights adapt so that macro factors carry greater influence when **volatility is elevated**.
 
-Market data: All scripts use Yahoo Finance
- via yfinance (auto_adjust=False) for spot FX pairs, ETFs (UUP), futures (DX=F) and proxies (gold, VIX, S&P 500). Macroeconomic notebooks scrape TradingEconomics and ForexFactory for interest rates, GDP growth, inflation and event calendars. News sentiment is derived from FXStreet or Google News RSS feeds via feedparser and scored with VADER.
+### 2.6 Probability Density Functions
+Optional PDFs for 1–3 day horizons describe return distributions (skewness, kurtosis) and provide **p5/p50/p95** intervals alongside **VaR(95%)** and **ES(95%)**.
 
-Volatility modelling: Realised volatility measures (True Range ADR, Parkinson estimator, EWMA) are combined with multi‑model conditional volatility forecasting using the arch package. The enhanced model tests GARCH, EGARCH and GJR‑GARCH with Student‑t innovations and selects the AIC‑optimal model. Regime detection uses a two‑state Markov switching model from statsmodels.
+---
 
-Drift estimation: Drift signals come from momentum (recent log‑returns), carry trades (interest rate differentials), macro fundamentals (GDP/inflation differentials), sentiment and technical indicators (RSI, Bollinger position, ADX proxy). Weights are tuned to ensure no single component overwhelms the forecast (see inline comments in the code).
+## 3. Engineering Notes
+- **Yahoo Finance**: `auto_adjust=False` throughout to avoid spurious adjustments in FX series.
+- **403-safe interest-rate retrieval**: TradingEconomics scraped with browser-like headers; **ForexFactory** as resilient fallback.
+- **Model stability**: `rescale=False` in the GARCH family; Student-t innovations for heavy tails; an **outlier-winsorised** return snapshot logged for diagnostics.
+- **Reproducibility**: JSON run metadata; daily volatility backtest log; PCA/correlation/ADR snapshots exported as CSV.
+- **Safety nets**: local realised σ for failed fits; `ffill` on minor calendar gaps; **business-day reindexing**.
 
-Monte‑Carlo simulation: Directional forecasts and pair rankings are based on forward price simulations. The simple DXY script uses a Gaussian GBM, while the macro notebooks implement a jump‑diffusion process with fat‑tailed returns and rare jumps. Event calendars increase volatility multiplicatively and adjust drift additively around high‑impact events.
+---
 
-Diagnostics and reproducibility: Each run writes JSON/CSV logs (e.g., run_meta.json, volatility_forecasts.csv, pair_rankings_comprehensive.csv, walkforward_metrics.csv) so results can be audited. Seeds are set for reproducibility, and warnings/errors are handled gracefully (with fallback calculations) to prevent crashes.
-
-Extending the models
-
-Additional assets: To add more currency pairs or other asset classes (commodities, equities, crypto), modify the tickers dictionary and extend the drift and volatility logic accordingly. Ensure that you adjust the synthetic USD basket weights when adding new legs.
-
-Alternative data: The code is structured so that macro and sentiment inputs come from functions (fetch_interest_rates_enhanced, fetch_economic_indicators, fetch_news_sentiments). You can plug in premium data feeds or more sophisticated NLP models by replacing these functions.
-
-Parameter tuning: Many weights (e.g., sentiment scaling, regime transition thresholds, Monte‑Carlo jump probabilities) are exposed as variables in the notebooks. Experiment with different horizons, trial counts or weighting schemes to stress‑test the robustness of the signals.
+## 4. Limitations
+- Public data may lag, and schema can change; verify key diagnostics on event days.
+- Calendar and sentiment features are **lightweight heuristics**; consider extending with richer NLP or professional data feeds.
+- This codebase is provided strictly for **research**; it does **not** constitute investment advice.
