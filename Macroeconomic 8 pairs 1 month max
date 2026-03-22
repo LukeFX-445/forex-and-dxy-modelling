@@ -4,7 +4,7 @@
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
-warnings.filterwarnings('ignore', category=RuntimeWarning)  # FIX: suppress numpy RuntimeWarnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)  # suppress numpy RuntimeWarnings
 
 !pip install yfinance arch pandas numpy scipy scikit-learn statsmodels fredapi --quiet
 
@@ -31,8 +31,10 @@ print("=" * 80)
 print("ENHANCED FX FORECASTING SYSTEM - INITIALIZATION")
 print("=" * 80)
 
-# Define currency tickers (spot FX on Yahoo Finance)
-# FIX: DX-Y.NYB is delisted; replaced with DX=F (DXY futures, continuously available)
+# FIX: probe a list of candidate USD index tickers at runtime; use whichever
+# responds first. If none work, the synthetic basket built in Section 2 covers it.
+USD_INDEX_CANDIDATES = ['DX-Y.NYB', 'DX=F']
+
 tickers = {
     'EUR': 'EURUSD=X',
     'GBP': 'GBPUSD=X',
@@ -41,8 +43,24 @@ tickers = {
     'CHF': 'USDCHF=X',
     'AUD': 'AUDUSD=X',
     'NZD': 'NZDUSD=X',
-    'USD': 'DX=F'  # FIX: replaced delisted DX-Y.NYB with DX=F
 }
+
+usd_index_ticker = None
+for candidate in USD_INDEX_CANDIDATES:
+    try:
+        _probe = yf.download(candidate, period='5d', interval='1d',
+                             auto_adjust=False, progress=False)
+        if not _probe.empty:
+            usd_index_ticker = candidate
+            break
+    except Exception:
+        continue
+
+if usd_index_ticker:
+    tickers['USD'] = usd_index_ticker
+    print(f"✓ USD index ticker resolved: {usd_index_ticker}")
+else:
+    print("Note: No live USD index ticker found — will use synthetic basket only")
 
 # Fetch daily OHLCV for the last 3 years
 print("\n[1/10] Fetching spot FX data...")
@@ -97,14 +115,17 @@ closes['JPYUSD'] = 1 / closes['USDJPY=X']
 closes['CHFUSD'] = 1 / closes['USDCHF=X']
 closes['CADUSD'] = 1 / closes['USDCAD=X']
 
-# Rename for clarity
-closes = closes.rename(columns={
+# FIX: build rename map dynamically so it always matches whichever ticker was fetched
+rename_map = {
     'EURUSD=X': 'EURUSD',
     'GBPUSD=X': 'GBPUSD',
     'AUDUSD=X': 'AUDUSD',
     'NZDUSD=X': 'NZDUSD',
-    'DX=F': 'USD_Index'  # FIX: updated rename key to match new ticker
-})
+}
+if usd_index_ticker:
+    rename_map[usd_index_ticker] = 'USD_Index'
+
+closes = closes.rename(columns=rename_map)
 
 # Drop original inverted columns
 closes = closes.drop(columns=['USDJPY=X', 'USDCHF=X', 'USDCAD=X'], errors='ignore')
@@ -183,10 +204,8 @@ for cur in currencies:
         smoothed_probs = res.smoothed_marginal_probabilities
         current_prob = smoothed_probs.iloc[-1].values
 
-        # FIX: access regime variances by positional index rather than string key
-        # params layout for MarkovRegression with switching_variance:
-        # [const[0], const[1], sigma2[0], sigma2[1], transition probs...]
-        # Use res.params index to locate sigma2 entries robustly
+        # FIX: locate sigma2 params by searching the index rather than using
+        # hardcoded string keys which vary across statsmodels versions
         param_index = list(res.params.index)
         sigma2_keys = [k for k in param_index if 'sigma2' in str(k).lower()]
 
@@ -194,7 +213,6 @@ for cur in currencies:
             vol0 = float(np.sqrt(abs(res.params[sigma2_keys[0]])) / 100)
             vol1 = float(np.sqrt(abs(res.params[sigma2_keys[1]])) / 100)
         else:
-            # Fallback: estimate regime vols from smoothed probabilities
             vol0 = float(ret_series.std() / 100) * 0.7
             vol1 = float(ret_series.std() / 100) * 1.3
 
@@ -526,10 +544,12 @@ def compute_technical_indicators(prices, returns_data):
 
         # Trend strength (ADX approximation)
         try:
-            high = data_raw['High'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''),
-                                                tickers.get('USD', 'DX=F'))]  # FIX: updated fallback ticker
-            low = data_raw['Low'][tickers.get(cur.replace('USD', '').replace('Index', '').replace('_', ''),
-                                              tickers.get('USD', 'DX=F'))]  # FIX: updated fallback ticker
+            # FIX: use the resolved usd_index_ticker for the fallback lookup
+            _fallback = usd_index_ticker if usd_index_ticker else 'EURUSD=X'
+            high = data_raw['High'][tickers.get(
+                cur.replace('USD', '').replace('Index', '').replace('_', ''), _fallback)]
+            low = data_raw['Low'][tickers.get(
+                cur.replace('USD', '').replace('Index', '').replace('_', ''), _fallback)]
 
             tr = pd.concat([
                 high - low,
@@ -604,10 +624,9 @@ def calculate_macro_drift(indicators_dict, rates_dict):
         gdp_drift = 0.0
         if gdp_key in indicators_dict and usd_gdp_key in indicators_dict:
             gdp_diff = indicators_dict[gdp_key] - indicators_dict[usd_gdp_key]
-            # GDP differential contributes to drift (higher growth -> stronger currency)
             gdp_drift = (gdp_diff / 100.0) / 252.0 * 0.5  # Scale down
 
-        # Inflation differential (opposite effect - higher inflation strengthens currency)
+        # Inflation differential
         inf_key = f'{base_ccy}_INFLATION'
         usd_inf_key = 'USD_INFLATION'
 
@@ -633,11 +652,10 @@ def calculate_sentiment_drift(sentiment_dict):
         sent = sentiment_dict.get(base_ccy, 0.0)
         usd_sent = sentiment_dict.get('USD', 0.0)
 
-        # Sentiment differential scaled to daily drift
-        # FIX: reduced from 0.002 to 0.0002 — sentiment is a weak signal and was
-        # previously capable of injecting ±0.2%/day, swamping the carry component
+        # FIX: reduced from 0.002 to 0.0002 — was injecting up to ±0.2%/day,
+        # swamping the carry signal; now capped at ±0.02%/day
         sent_diff = sent - usd_sent
-        sentiment_drift[cur] = sent_diff * 0.0002  # ±0.02% daily max
+        sentiment_drift[cur] = sent_diff * 0.0002
 
     return sentiment_drift
 
@@ -652,31 +670,28 @@ def calculate_technical_drift(tech_dict):
 
         indicators = tech_dict[cur]
 
-        # Momentum component (weighted average of recent daily log returns)
-        # FIX: raw momentum values are already daily log returns (~0.001–0.005 scale).
-        # Previously these were passed unscaled as daily drift, letting a good week
-        # inject a persistent 0.3%/day forward bias.  We now apply a 0.1 decay factor
-        # so momentum contributes a small, proportional tilt rather than a dominant one.
+        # FIX: momentum values are raw daily log returns; apply 0.1 decay factor
+        # so a strong recent week doesn't dominate the forward drift estimate
         mom_drift = (
             indicators['momentum_5d'] * 0.5 +
             indicators['momentum_20d'] * 0.3 +
             indicators['momentum_60d'] * 0.2
-        ) * 0.1  # FIX: decay factor — momentum is a tilt, not a directional engine
+        ) * 0.1
 
-        # RSI mean reversion (extreme readings suggest reversal)
+        # RSI mean reversion — FIX: reduced to match carry scale
         rsi = indicators['rsi_14']
         if rsi > 70:
-            rsi_drift = -0.0001  # FIX: reduced from -0.001 to keep same magnitude as carry
+            rsi_drift = -0.0001
         elif rsi < 30:
-            rsi_drift = 0.0001   # FIX: reduced from  0.001
+            rsi_drift = 0.0001
         else:
             rsi_drift = 0.0
 
-        # Bollinger Band position
+        # Bollinger Band mean reversion — FIX: reduced from 0.001 to 0.0001
         bb = indicators['bb_position']
-        bb_drift = (bb - 0.5) * 0.0001  # FIX: reduced from 0.001 — mean reversion is a small nudge
+        bb_drift = (bb - 0.5) * 0.0001
 
-        technical_drift[cur] = mom_drift + rsi_drift - bb_drift  # Subtract BB for mean reversion
+        technical_drift[cur] = mom_drift + rsi_drift - bb_drift
 
     return technical_drift
 
@@ -723,10 +738,9 @@ def simulate_prices_advanced(initial_price, drift, vol, regime_vol_adjust, days=
     - Jump diffusion (rare events)
     - Fat-tailed returns (Student-t)
     """
-    # FIX: seed removed from inside function — previously np.random.seed(42) was called
-    # at the top of every invocation, which reset the RNG before each currency/horizon run.
-    # This caused every currency to draw the exact same random sequence, artificially
-    # correlating all simulation outputs.  The caller sets a unique seed per run instead.
+    # FIX: seed removed from inside the function — it was resetting the RNG
+    # identically before every currency/horizon call so all currencies drew
+    # the same random sequence. Seed is now set once before the outer loop.
     results = []
 
     for _ in range(trials):
@@ -754,9 +768,7 @@ def simulate_prices_advanced(initial_price, drift, vol, regime_vol_adjust, days=
 
 # Simulation parameters
 trials = 5000
-# FIX: removed duplicate '5d' entry — previously both '5d' and '1w' mapped to days=5,
-# meaning the pair ranking (which uses '1w') was identical to '5d'. Now '5d' is removed
-# and '1w' is the canonical 5-day horizon used for ranking.
+# FIX: removed duplicate '5d' (identical to '1w') and '3m'
 horizons = {'1d': 1, '1w': 5, '2w': 10, '1m': 22}
 
 # Get current prices
@@ -766,10 +778,9 @@ for cur in currencies:
 
 # Run simulations
 sim_results = {h: {} for h in horizons}
-sim_return_arrays = {h: {} for h in horizons}  # FIX: store actual distributions for ranking
+sim_return_arrays = {h: {} for h in horizons}  # store distributions for ranking
 
-# FIX: set a single reproducible seed ONCE before the outer loop so each
-# currency/horizon gets a genuinely independent (but reproducible) draw sequence
+# FIX: single reproducible seed set once so each currency gets independent draws
 np.random.seed(42)
 
 for horizon_name, days in horizons.items():
@@ -783,10 +794,8 @@ for horizon_name, days in horizons.items():
         mu = total_drift.get(cur, 0.0)
         sigma = volatility_final.get(cur, 0.01)
 
-        # FIX: regime vol adjustment was being applied twice — once when building
-        # volatility_final (Section 4 blends regime_0_vol and regime_1_vol by probability)
-        # and again here.  Since volatility_final already encodes the regime-weighted vol,
-        # we pass regime_adjust=1.0 unconditionally so the simulation uses it as-is.
+        # FIX: volatility_final already encodes regime-weighted vol from Section 4;
+        # applying a second regime multiplier here double-counts it — pass 1.0
         regime_adjust = 1.0
 
         # Run simulation
@@ -799,7 +808,7 @@ for horizon_name, days in horizons.items():
         # Calculate statistics
         returns_sim = (final_prices / P0 - 1.0) * 100  # Percentage returns
 
-        # FIX: guard CVaR calculation against empty tail slice
+        # FIX: guard CVaR against empty tail slice
         p5_threshold = np.percentile(returns_sim, 5)
         tail_returns = returns_sim[returns_sim <= p5_threshold]
         cvar_95 = float(-np.mean(tail_returns)) if len(tail_returns) > 0 else float(-p5_threshold)
@@ -815,14 +824,12 @@ for horizon_name, days in horizons.items():
             'p75': float(np.percentile(returns_sim, 75)),
             'p95': float(np.percentile(returns_sim, 95)),
             'VaR_95': float(-p5_threshold),
-            'CVaR_95': cvar_95,  # FIX: use guarded value
+            'CVaR_95': cvar_95,
             'prob_up': float(np.mean(final_prices > P0)),
             'expected_price': float(np.mean(final_prices)),
             'expected_range_low': float(np.percentile(final_prices, 16)),
             'expected_range_high': float(np.percentile(final_prices, 84))
         }
-        # FIX: store the actual return distribution so ranking can use it directly
-        # instead of re-sampling a Gaussian approximation
         sim_return_arrays[horizon_name][cur] = returns_sim
 
 # Save simulation results
@@ -878,16 +885,15 @@ for cur in currencies:
     # Risk-adjusted metrics
     sharpe = calculate_sharpe_ratio(stats_1w['mean_return'], stats_1w['std_return'])
 
-    # FIX: use the actual fat-tailed jump-diffusion return distribution stored from
-    # the simulation, rather than re-sampling a Normal approximation.  The whole point
-    # of the advanced simulation is to get a non-Gaussian distribution; discarding it
-    # here and replacing with np.random.normal() defeats that purpose.
+    # FIX: use the actual fat-tailed simulation distribution rather than
+    # re-sampling a Normal approximation — preserves the skew and kurtosis
+    # that the jump-diffusion model was specifically designed to capture
     actual_returns = sim_return_arrays.get('1w', {}).get(cur, None)
     if actual_returns is not None and len(actual_returns) > 0:
         returns_for_ranking = actual_returns
     else:
-        # Fallback only if array somehow missing
-        returns_for_ranking = np.random.normal(stats_1w['mean_return'], stats_1w['std_return'], 1000)
+        returns_for_ranking = np.random.normal(
+            stats_1w['mean_return'], stats_1w['std_return'], 1000)
 
     sortino = calculate_sortino_ratio(returns_for_ranking)
     omega = calculate_omega_ratio(returns_for_ranking)
@@ -1176,7 +1182,7 @@ print("   - regime_detection.csv")
 print("   - volatility_forecasts.csv")
 print("   - technical_indicators.csv")
 print("   - drift_components.csv")
-print("   - sim_results_*.csv (multiple horizons)")
+print("   - sim_results_*.csv (1d, 1w, 2w, 1m)")
 print("   - pair_rankings_comprehensive.csv")
 print("   - correlation_matrix.csv")
 print("   - summary_statistics.csv")
