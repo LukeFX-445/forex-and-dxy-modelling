@@ -1,4 +1,4 @@
-# forex-and-dxy-modelling
+# Modelling
 
 This repository contains two complementary models: (i) a cross-sectional engine for currency-pair selection, and (ii) a short-horizon directional model for the U.S. Dollar Index (DXY). Both models are research prototypes that fetch public market data, perform regime-aware volatility and drift estimation, run Monte Carlo simulations, and output diagnostic files. They are meant for transparent analysis and reproducible research, not for live trading.
 
