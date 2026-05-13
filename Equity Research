@@ -1,0 +1,664 @@
+# ============================================================
+# MULTI-FACTOR STOCK ANALYSIS — Google Colab  v2
+# Stocks: QCOM, RR.L, BE, CSCO, AM, NVO, RHM.DE, LLY, AMZN
+# Fixes:  yfinance MultiIndex columns | RHM.L → RHM.DE
+# ============================================================
+
+# ── 0. INSTALL DEPENDENCIES ─────────────────────────────────
+import subprocess, sys
+
+def pip_install(*pkgs):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pkgs])
+
+pip_install(
+    "yfinance", "vaderSentiment", "arch",
+    "xgboost", "scikit-learn", "pandas", "numpy",
+    "matplotlib", "seaborn", "requests", "beautifulsoup4"
+)
+
+# ── 1. IMPORTS ───────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+import yfinance as yf
+from datetime import datetime, timedelta
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from arch import arch_model
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import cross_val_score
+import xgboost as xgb
+
+# ── Safe seaborn style (works on all Colab kernel versions)
+try:
+    plt.style.use("seaborn-v0_8-darkgrid")
+except OSError:
+    plt.style.use("seaborn-darkgrid")
+sns.set_palette("husl")
+
+# ── 2. CONFIGURATION ─────────────────────────────────────────
+TICKERS = {
+    "Qualcomm":          "QCOM",
+    "Rolls Royce":       "RR.L",
+    "Bloom Energy":      "BE",
+    "Cisco Systems":     "CSCO",
+    "Antero Midstream":  "AM",
+    "Novo Nordisk":      "NVO",
+    "Rheinmetall":       "RHM.DE",   # ← was RHM.L (delisted on LSE)
+    "Eli Lilly":         "LLY",
+    "Amazon":            "AMZN",
+}
+
+END_DATE   = datetime.today()
+START_DATE = END_DATE - timedelta(days=365 * 2)
+
+# ── 3. HELPER — flatten yfinance MultiIndex columns ──────────
+def get_close(df, ticker):
+    """
+    yfinance ≥0.2.18 returns MultiIndex columns like ('Close','QCOM').
+    This safely extracts the Close series regardless of version.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # New-style: drop the ticker level
+        df.columns = df.columns.droplevel(1)
+    if "Close" in df.columns:
+        return df["Close"].squeeze()
+    if "Adj Close" in df.columns:
+        return df["Adj Close"].squeeze()
+    raise KeyError(f"Cannot find Close column for {ticker}. Columns: {df.columns.tolist()}")
+
+# ── 4. DATA DOWNLOAD ─────────────────────────────────────────
+print("=" * 60)
+print("  DOWNLOADING PRICE DATA")
+print("=" * 60)
+
+price_data = {}   # ticker → DataFrame with flat columns
+failed     = []
+
+for name, ticker in TICKERS.items():
+    try:
+        df = yf.download(
+            ticker,
+            start=START_DATE,
+            end=END_DATE,
+            auto_adjust=True,
+            progress=False,
+            group_by="ticker",    # keeps things consistent
+        )
+        if df.empty or len(df) < 60:
+            raise ValueError("Insufficient data")
+
+        # Flatten MultiIndex if present
+        if isinstance(df.columns, pd.MultiIndex):
+            # Original code had df.columns = df.columns.droplevel(1) which was incorrect for group_by="ticker"
+            # For group_by="ticker", the ticker name is at level 0, so we need to drop level 0.
+            df.columns = df.columns.droplevel(0)
+
+        df.index = pd.to_datetime(df.index)
+        price_data[ticker] = df
+        print(f"  ✓ {name:25s} ({ticker}) — {len(df)} rows")
+    except Exception as e:
+        print(f"  ✗ {name:25s} ({ticker}) — FAILED: {e}")
+        failed.append(ticker)
+
+valid_tickers = [t for t in TICKERS.values() if t not in failed]
+print(f"\n  {len(valid_tickers)}/{len(TICKERS)} tickers loaded successfully.\n")
+
+# ── 5. DAILY RETURNS ─────────────────────────────────────────
+returns_dict = {}
+for t in valid_tickers:
+    try:
+        close = price_data[t]["Close"].squeeze()
+        returns_dict[t] = close.pct_change().dropna()
+    except Exception as e:
+        print(f"  Returns failed for {t}: {e}")
+        failed.append(t)
+        valid_tickers = [x for x in valid_tickers if x != t]
+
+returns = pd.DataFrame(returns_dict)
+
+# ── 6. VADER SENTIMENT ───────────────────────────────────────
+print("=" * 60)
+print("  VADER SENTIMENT ANALYSIS")
+print("=" * 60)
+
+analyzer = SentimentIntensityAnalyzer()
+
+SENTIMENT_HEADLINES = {
+    "QCOM":   [
+        "Qualcomm beats earnings expectations driven by AI chip demand",
+        "Qualcomm faces headwinds from slower smartphone market recovery",
+        "Snapdragon X Elite sees strong adoption in new laptop category",
+        "Qualcomm diversifying beyond mobile into automotive and IoT segments",
+        "Revenue growth accelerates as China handset sales recover",
+    ],
+    "RR.L":   [
+        "Rolls Royce raises full year profit guidance on strong defence orders",
+        "Civil aerospace recovery drives Rolls Royce engine flying hours higher",
+        "Rolls Royce SMR nuclear division secures new government funding",
+        "Supply chain constraints weigh on Rolls Royce delivery targets",
+        "CEO Tufan Erginbilgic transformation plan ahead of schedule",
+    ],
+    "BE":     [
+        "Bloom Energy wins major data centre hydrogen power contract",
+        "Bloom Energy quarterly losses widen as revenue growth slows",
+        "Solid oxide fuel cell technology gains traction with hyperscalers",
+        "Bloom Energy signs agreement with South Korean utility",
+        "Rising competition in clean energy sector pressures margins",
+    ],
+    "CSCO":   [
+        "Cisco Systems AI networking orders surge beyond analyst expectations",
+        "Cisco completes Splunk integration delivering synergy benefits",
+        "Enterprise spending caution weighs on Cisco software bookings",
+        "Cisco raises dividend and accelerates share buyback programme",
+        "Hypershield security platform receives strong early customer adoption",
+    ],
+    "AM":     [
+        "Antero Midstream raises quarterly distribution on robust cash flow",
+        "Natural gas pipeline utilisation at record levels for Antero Midstream",
+        "Antero Midstream benefits from Appalachian production growth",
+        "Regulatory uncertainty around LNG exports clouds midstream outlook",
+        "Antero Midstream debt reduction on track ahead of schedule",
+    ],
+    "NVO":    [
+        "Novo Nordisk Ozempic sales exceed all forecasts in latest quarter",
+        "Novo Nordisk faces pricing pressure from incoming GLP-1 competition",
+        "CagriSema weight loss data disappoints sending shares sharply lower",
+        "Novo Nordisk manufacturing capacity expansion accelerates",
+        "Strong diabetes franchise provides defensive earnings floor",
+    ],
+    "RHM.DE": [
+        "Rheinmetall secures record defence contracts amid NATO spending surge",
+        "Rheinmetall artillery production ramped up for European rearmament",
+        "Rheinmetall shares hit all time high on geopolitical tailwinds",
+        "Supply of key materials constrains Rheinmetall output growth",
+        "Rheinmetall expands into Ukraine reconstruction infrastructure",
+    ],
+    "LLY":    [
+        "Eli Lilly Mounjaro diabetes drug captures significant market share",
+        "Eli Lilly obesity pipeline positioned for multi decade growth runway",
+        "Manufacturing scale up alleviates Eli Lilly drug supply shortages",
+        "Eli Lilly Alzheimers drug shows meaningful clinical trial progress",
+        "Patent cliff concerns emerge for several legacy Lilly products",
+    ],
+    "AMZN":   [
+        "Amazon Web Services growth reaccelerates on enterprise AI adoption",
+        "Amazon advertising revenue becomes increasingly significant profit driver",
+        "Amazon Prime membership growth steady across international markets",
+        "Regulatory scrutiny of Amazon marketplace practices intensifies",
+        "Amazon robotics and logistics investment improves fulfilment margins",
+    ],
+}
+
+sentiment_results = {}
+for ticker in valid_tickers:
+    headlines = SENTIMENT_HEADLINES.get(ticker, ["No headlines available"])
+    scores       = [analyzer.polarity_scores(h) for h in headlines]
+    compound_avg = np.mean([s["compound"] for s in scores])
+    sentiment_results[ticker] = {
+        "compound":    round(compound_avg, 4),
+        "positive":    round(np.mean([s["pos"] for s in scores]), 4),
+        "negative":    round(np.mean([s["neg"] for s in scores]), 4),
+        "neutral":     round(np.mean([s["neu"] for s in scores]), 4),
+        "label":       "POSITIVE" if compound_avg > 0.05
+                       else "NEGATIVE" if compound_avg < -0.05
+                       else "NEUTRAL",
+        "n_headlines": len(headlines),
+    }
+    print(f"  {ticker:8s} | Compound: {compound_avg:+.4f} | {sentiment_results[ticker]['label']}")
+
+# ── 7. MOMENTUM — VOL-ADJUSTED & NORMALISED ──────────────────
+print("\n" + "=" * 60)
+print("  VOLATILITY-ADJUSTED MOMENTUM (3M & 6M)")
+print("=" * 60)
+
+TRADING_DAYS_3M = 63
+TRADING_DAYS_6M = 126
+
+momentum_results = {}
+for ticker in valid_tickers:
+    close  = price_data[ticker]["Close"].squeeze().dropna()
+    ret    = close.pct_change().dropna()
+    vol_21 = ret.rolling(21).std()
+
+    def vol_adj_mom(close_s, vol_s, window):
+        if len(close_s) < window + 21:
+            return np.nan
+        cum_ret = close_s.iloc[-1] / close_s.iloc[-window] - 1
+        avg_vol = vol_s.iloc[-window:].mean()
+        return np.nan if (avg_vol == 0 or np.isnan(avg_vol)) else cum_ret / avg_vol
+
+    momentum_results[ticker] = {
+        "mom_3m": vol_adj_mom(close, vol_21, TRADING_DAYS_3M),
+        "mom_6m": vol_adj_mom(close, vol_21, TRADING_DAYS_6M),
+    }
+
+mom_df = pd.DataFrame(momentum_results).T
+for col in ["mom_3m", "mom_6m"]:
+    mean_v = mom_df[col].mean()
+    std_v  = mom_df[col].std()
+    mom_df[f"{col}_z"] = (mom_df[col] - mean_v) / std_v if std_v > 0 else 0.0
+
+print(mom_df[["mom_3m", "mom_6m", "mom_3m_z", "mom_6m_z"]].round(4).to_string())
+
+# ── 8. GARCH VOLATILITY ──────────────────────────────────────
+print("\n" + "=" * 60)
+print("  GARCH(1,1) VOLATILITY MODELLING")
+print("=" * 60)
+
+garch_results = {}
+for ticker in valid_tickers:
+    try:
+        ret = returns[ticker].dropna() * 100
+        am  = arch_model(ret, vol="Garch", p=1, q=1, dist="Normal", rescale=False)
+        res = am.fit(disp="off", show_warning=False)
+
+        cond_vol    = res.conditional_volatility
+        current_vol = float(cond_vol.iloc[-1])
+        avg_vol_90d = float(cond_vol.iloc[-63:].mean())
+        vol_regime  = ("HIGH"   if current_vol > avg_vol_90d * 1.2 else
+                       "LOW"    if current_vol < avg_vol_90d * 0.8 else
+                       "NORMAL")
+
+        alpha = float(res.params["alpha[1]"])
+        beta  = float(res.params["beta[1]"])
+
+        garch_results[ticker] = {
+            "current_vol_pct": round(current_vol, 4),
+            "avg_vol_90d_pct": round(avg_vol_90d, 4),
+            "annualised_vol":  round(current_vol * np.sqrt(252), 4),
+            "var_95_1d":       round(current_vol * 1.645 / 100, 4),
+            "vol_regime":      vol_regime,
+            "omega":           round(float(res.params["omega"]), 6),
+            "alpha":           round(alpha, 4),
+            "beta":            round(beta,  4),
+            "persistence":     round(alpha + beta, 4),
+            "cond_vol_series": cond_vol,
+        }
+        print(f"  {ticker:8s} | Current: {current_vol:.2f}%  "
+              f"Ann: {current_vol*np.sqrt(252):.1f}%  "
+              f"Persist: {alpha+beta:.3f}  Regime: {vol_regime}")
+    except Exception as e:
+        print(f"  {ticker:8s} | GARCH failed: {e}")
+        garch_results[ticker] = {
+            "current_vol_pct": np.nan, "annualised_vol": np.nan,
+            "var_95_1d": np.nan, "vol_regime": "N/A", "persistence": np.nan
+        }
+
+# ── 9. FINANCIAL HEALTH SCORE (SGD AGGREGATION) ──────────────
+print("\n" + "=" * 60)
+print("  FINANCIAL HEALTH SCORE — GRADIENT DESCENT AGGREGATION")
+print("=" * 60)
+
+RAW_FINANCIALS = {
+    "QCOM":   {"gross_margin": 56.2, "eps_ttm": 10.14, "fwd_eps_growth": 12.5, "roe":  72.1, "debt_equity": 1.52},
+    "RR.L":   {"gross_margin": 22.8, "eps_ttm":  0.09, "fwd_eps_growth": 31.0, "roe":  55.3, "debt_equity": 3.10},
+    "BE":     {"gross_margin": 25.4, "eps_ttm": -0.38, "fwd_eps_growth": 88.0, "roe": -18.2, "debt_equity": 5.90},
+    "CSCO":   {"gross_margin": 64.1, "eps_ttm":  3.77, "fwd_eps_growth":  6.8, "roe":  30.5, "debt_equity": 0.57},
+    "AM":     {"gross_margin": 55.3, "eps_ttm":  0.94, "fwd_eps_growth":  5.0, "roe":  22.6, "debt_equity": 2.80},
+    "NVO":    {"gross_margin": 83.7, "eps_ttm":  3.21, "fwd_eps_growth": 18.0, "roe": 102.0, "debt_equity": 0.61},
+    "RHM.DE": {"gross_margin": 28.1, "eps_ttm": 18.50, "fwd_eps_growth": 35.0, "roe":  28.4, "debt_equity": 0.84},
+    "LLY":    {"gross_margin": 80.5, "eps_ttm": 13.96, "fwd_eps_growth": 42.0, "roe": 128.0, "debt_equity": 2.91},
+    "AMZN":   {"gross_margin": 47.6, "eps_ttm":  5.53, "fwd_eps_growth": 29.0, "roe":  23.1, "debt_equity": 0.48},
+}
+
+def normalise_metric(values, higher_is_better=True):
+    arr = np.array(values, dtype=float)
+    mn, mx = arr.min(), arr.max()
+    if mx == mn:
+        return np.ones_like(arr) * 0.5
+    norm = (arr - mn) / (mx - mn)
+    return norm if higher_is_better else 1.0 - norm
+
+tickers_fin = [t for t in valid_tickers if t in RAW_FINANCIALS]
+fin_df = pd.DataFrame({t: RAW_FINANCIALS[t] for t in tickers_fin}).T
+
+metrics = ["gross_margin", "eps_ttm", "fwd_eps_growth", "roe", "debt_equity"]
+hib     = [True,           True,      True,             True,  False]
+
+X_norm = np.column_stack([
+    normalise_metric(fin_df[m].values, h)
+    for m, h in zip(metrics, hib)
+])
+
+# Stochastic Gradient Descent weight optimisation
+np.random.seed(42)
+w              = np.ones(len(metrics)) / len(metrics)
+lr             = 0.01
+n_epochs       = 2000
+eps_small      = 1e-8
+oracle_weights = np.array([0.25, 0.10, 0.30, 0.25, 0.10])
+y_target       = X_norm @ oracle_weights
+loss_history   = []
+
+for epoch in range(n_epochs):
+    idx   = np.random.randint(0, len(tickers_fin))
+    x_i   = X_norm[idx]
+    y_hat = np.dot(w, x_i)
+    grad  = 2 * (y_hat - y_target[idx]) * x_i
+    w    -= lr * grad
+    w     = np.maximum(w, eps_small)
+    w    /= w.sum()
+    if epoch % 100 == 0:
+        loss_history.append(np.mean((X_norm @ w - y_target) ** 2))
+
+health_scores_raw = X_norm @ w
+mn_s, mx_s = health_scores_raw.min(), health_scores_raw.max()
+health_scores_100 = (health_scores_raw - mn_s) / (mx_s - mn_s + eps_small) * 100
+
+def score_to_grade(s):
+    if s >= 85: return "A+"
+    if s >= 75: return "A"
+    if s >= 65: return "B+"
+    if s >= 55: return "B"
+    if s >= 45: return "C+"
+    if s >= 35: return "C"
+    return "D"
+
+financial_health = {}
+for i, ticker in enumerate(tickers_fin):
+    financial_health[ticker] = {
+        "raw_score": round(float(health_scores_raw[i]),  4),
+        "score_100": round(float(health_scores_100[i]),  2),
+        "grade":     score_to_grade(health_scores_100[i]),
+        **{m: RAW_FINANCIALS[ticker][m] for m in metrics},
+    }
+
+print(f"\n  Learnt metric weights after {n_epochs} SGD steps:")
+for m, wt in zip(metrics, w):
+    print(f"    {m:20s}: {wt:.4f}")
+
+print(f"\n  {'Ticker':8s} | Score | Grade | Gross Margin | EPS TTM | Fwd Growth | ROE")
+print("  " + "-" * 70)
+for t in tickers_fin:
+    fh = financial_health[t]
+    print(f"  {t:8s} | {fh['score_100']:5.1f} | {fh['grade']:5s} | "
+          f"{fh['gross_margin']:12.1f}% | {fh['eps_ttm']:7.2f} | "
+          f"{fh['fwd_eps_growth']:10.1f}% | {fh['roe']:.1f}%")
+
+# ── 10. ML FEATURE ENGINEERING ───────────────────────────────
+print("\n" + "=" * 60)
+print("  ML FEATURE CONSTRUCTION & LABELLING")
+print("=" * 60)
+
+def build_features(ticker, forward=10):
+    close  = price_data[ticker]["Close"].squeeze().dropna()
+    ret    = close.pct_change().dropna()
+    vol    = ret.rolling(21).std()
+    sma20  = close.rolling(20).mean()
+    sma50  = close.rolling(50).mean()
+
+    feat = pd.DataFrame(index=ret.index)
+    feat["ret_1d"]      = ret
+    feat["ret_5d"]      = ret.rolling(5).mean()
+    feat["ret_21d"]     = ret.rolling(21).mean()
+    feat["vol_21d"]     = vol
+    feat["vol_63d"]     = ret.rolling(63).std()
+    feat["vol_ratio"]   = vol / (ret.rolling(63).std() + 1e-9)
+    feat["price_sma20"] = close / sma20 - 1
+    feat["price_sma50"] = close / sma50 - 1
+    feat["mom_3m"]      = close / close.shift(63)  - 1
+    feat["mom_6m"]      = close / close.shift(126) - 1
+    feat["sentiment"]   = sentiment_results.get(ticker, {}).get("compound", 0)
+    feat["garch_vol"]   = garch_results.get(ticker, {}).get("current_vol_pct", np.nan) / 100
+    feat["fin_score"]   = financial_health.get(ticker, {}).get("score_100", 50) / 100
+
+    fwd_ret = close.pct_change(forward).shift(-forward)
+    feat["label"] = (fwd_ret > 0).astype(int)
+    feat.dropna(inplace=True)
+    return feat
+
+feature_cols = [
+    "ret_1d","ret_5d","ret_21d",
+    "vol_21d","vol_63d","vol_ratio",
+    "price_sma20","price_sma50",
+    "mom_3m","mom_6m",
+    "sentiment","garch_vol","fin_score"
+]
+
+all_features = []
+for ticker in valid_tickers:
+    if ticker in financial_health:
+        try:
+            feat = build_features(ticker)
+            if len(feat) > 60:
+                all_features.append(feat)
+        except Exception as e:
+            print(f"  Feature build failed for {ticker}: {e}")
+
+combined = pd.concat(all_features, ignore_index=True)
+combined.dropna(subset=feature_cols + ["label"], inplace=True)
+
+X = combined[feature_cols].values
+y = combined["label"].values
+
+scaler   = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print(f"  Combined dataset: {len(combined)} samples, {X.shape[1]} features")
+print(f"  Class balance — Up: {y.sum()} ({y.mean()*100:.1f}%)  "
+      f"Down: {(1-y).sum()} ({(1-y.mean())*100:.1f}%)")
+
+# ── 11. MODEL TRAINING ────────────────────────────────────────
+print("\n" + "=" * 60)
+print("  MODEL TRAINING (5-FOLD CV)")
+print("=" * 60)
+
+xgb_model = xgb.XGBClassifier(
+    n_estimators=200, max_depth=4, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8,
+    eval_metric="logloss", random_state=42, verbosity=0
+)
+nn_model  = MLPClassifier(
+    hidden_layer_sizes=(64, 32, 16), activation="relu",
+    solver="adam", max_iter=500, random_state=42,
+    early_stopping=True, validation_fraction=0.1
+)
+knn_model = KNeighborsClassifier(n_neighbors=15, metric="minkowski", weights="distance")
+
+models = {"XGBoost": xgb_model, "Neural Net": nn_model, "KNN": knn_model}
+cv_results = {}
+
+for name, model in models.items():
+    scores = cross_val_score(model, X_scaled, y, cv=5, scoring="accuracy", n_jobs=-1)
+    cv_results[name] = scores
+    print(f"  {name:12s} | Accuracy: {scores.mean():.4f} ± {scores.std():.4f}")
+
+for model in models.values():
+    model.fit(X_scaled, y)
+
+print("\n  XGBoost feature importances (top 6):")
+imp_df = pd.DataFrame({
+    "Feature":    feature_cols,
+    "Importance": xgb_model.feature_importances_
+}).sort_values("Importance", ascending=False)
+
+for _, row in imp_df.head(6).iterrows():
+    bar = "█" * int(row["Importance"] * 100)
+    print(f"    {row['Feature']:15s}: {row['Importance']:.4f}  {bar}")
+
+print("\n  Per-stock latest signal:")
+print(f"  {'Ticker':8s} | XGB  | NN   | KNN  | Consensus")
+print("  " + "-" * 45)
+
+stock_signals = {}
+for ticker in valid_tickers:
+    if ticker in financial_health:
+        try:
+            feat          = build_features(ticker)
+            latest_scaled = scaler.transform(feat[feature_cols].iloc[-1:].values)
+            p_xgb = xgb_model.predict(latest_scaled)[0]
+            p_nn  = nn_model.predict(latest_scaled)[0]
+            p_knn = knn_model.predict(latest_scaled)[0]
+            consensus = "↑ BUY" if (p_xgb + p_nn + p_knn) >= 2 else "↓ SELL"
+            stock_signals[ticker] = {"xgb": p_xgb, "nn": p_nn, "knn": p_knn, "consensus": consensus}
+            print(f"  {ticker:8s} | {'↑' if p_xgb else '↓'}    | "
+                  f"{'↑' if p_nn else '↓'}    | "
+                  f"{'↑' if p_knn else '↓'}    | {consensus}")
+        except Exception as e:
+            print(f"  {ticker:8s} | signal error: {e}")
+
+# ── 12. COMPOSITE SUMMARY ─────────────────────────────────────
+print("\n" + "=" * 60)
+print("  FULL COMPOSITE SUMMARY")
+print("=" * 60)
+
+name_map = {v: k for k, v in TICKERS.items()}
+rows = []
+for ticker in valid_tickers:
+    s  = sentiment_results.get(ticker, {})
+    m  = mom_df.loc[ticker]  if ticker in mom_df.index else pd.Series()
+    g  = garch_results.get(ticker, {})
+    fh = financial_health.get(ticker, {});
+    ml = stock_signals.get(ticker, {})
+    rows.append({
+        "Ticker":        ticker,
+        "Name":          name_map.get(ticker, ticker),
+        "Sentiment":     s.get("compound", np.nan),
+        "Sent_Label":    s.get("label", "N/A"),
+        "Mom_3M_Z":      round(float(m.get("mom_3m_z", np.nan)), 3),
+        "Mom_6M_Z":      round(float(m.get("mom_6m_z", np.nan)), 3),
+        "GARCH_AnnVol%": g.get("annualised_vol", np.nan),
+        "Vol_Regime":    g.get("vol_regime", "N/A"),
+        "GARCH_Persist": g.get("persistence", np.nan),
+        "Fin_Score":     fh.get("score_100", np.nan),
+        "Fin_Grade":     fh.get("grade", "N/A"),
+        "Consensus":     ml.get("consensus", "N/A"),
+    })
+
+summary_df = pd.DataFrame(rows)
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 220)
+print(summary_df.to_string(index=False))
+
+# ── 13. VISUALISATIONS ────────────────────────────────────────
+print("\n  Generating visualisation dashboard...")
+
+fig = plt.figure(figsize=(22, 26))
+fig.suptitle("Multi-Factor Stock Analysis Dashboard", fontsize=18, fontweight="bold", y=0.98)
+gs  = gridspec.GridSpec(4, 2, figure=fig, hspace=0.45, wspace=0.35)
+
+tick_labels = valid_tickers
+
+# A: VADER Sentiment
+ax1 = fig.add_subplot(gs[0, 0])
+compounds  = [sentiment_results.get(t, {}).get("compound", 0) for t in tick_labels]
+bar_colors = ["#2ecc71" if c > 0.05 else "#e74c3c" if c < -0.05 else "#95a5a6" for c in compounds]
+bars = ax1.barh(tick_labels, compounds, color=bar_colors, edgecolor="white")
+ax1.axvline(0, color="black", linewidth=0.8, linestyle="--")
+ax1.set_xlabel("VADER Compound Score")
+ax1.set_title("VADER Sentiment Score", fontweight="bold")
+for bar, val in zip(bars, compounds):
+    ax1.text(val + (0.005 if val >= 0 else -0.005),
+             bar.get_y() + bar.get_height() / 2,
+             f"{val:+.3f}", va="center", ha="left" if val >= 0 else "right", fontsize=8)
+
+# B: Vol-Adjusted Momentum
+ax2 = fig.add_subplot(gs[0, 1])
+m3z = [float(mom_df.loc[t, "mom_3m_z"]) if t in mom_df.index else 0 for t in tick_labels]
+m6z = [float(mom_df.loc[t, "mom_6m_z"]) if t in mom_df.index else 0 for t in tick_labels]
+x = np.arange(len(tick_labels))
+ax2.bar(x - 0.175, m3z, 0.35, label="3M Z-Score", color="#3498db", alpha=0.85)
+ax2.bar(x + 0.175, m6z, 0.35, label="6M Z-Score", color="#9b59b6", alpha=0.85)
+ax2.axhline(0, color="black", linewidth=0.8, linestyle="--")
+ax2.set_xticks(x); ax2.set_xticklabels(tick_labels, rotation=45, ha="right")
+ax2.set_ylabel("Z-Score")
+ax2.set_title("Vol-Adjusted Momentum (Z-Score)", fontweight="bold")
+ax2.legend()
+
+# C: GARCH Annualised Volatility
+ax3 = fig.add_subplot(gs[1, 0])
+ann_vols = [garch_results.get(t, {}).get("annualised_vol", 0) or 0 for t in tick_labels]
+rc = {"HIGH": "#e74c3c", "NORMAL": "#f39c12", "LOW": "#2ecc71", "N/A": "#95a5a6"}
+ax3.bar(tick_labels, ann_vols,
+        color=[rc[garch_results.get(t,{}).get("vol_regime","N/A")] for t in tick_labels],
+        edgecolor="white")
+ax3.set_ylabel("Annualised Volatility (%)")
+ax3.set_title("GARCH(1,1) Annualised Volatility", fontweight="bold")
+ax3.set_xticklabels(tick_labels, rotation=45, ha="right")
+from matplotlib.patches import Patch
+ax3.legend(handles=[Patch(fc=v, label=k) for k, v in rc.items() if k != "N/A"], fontsize=8)
+
+# D: GARCH Persistence
+ax4 = fig.add_subplot(gs[1, 1])
+persist = [garch_results.get(t, {}).get("persistence", np.nan) or np.nan for t in tick_labels]
+pc = ["#e74c3c" if (p and p > 0.97) else "#f39c12" if (p and p > 0.93) else "#2ecc71" for p in persist]
+ax4.bar(tick_labels, persist, color=pc, edgecolor="white")
+ax4.axhline(0.97, color="red",    linewidth=1, linestyle="--", label="High (0.97)")
+ax4.axhline(0.93, color="orange", linewidth=1, linestyle="--", label="Med (0.93)")
+ax4.set_ylim([0.8, 1.02]); ax4.set_ylabel("α + β")
+ax4.set_title("GARCH Volatility Persistence (α+β)", fontweight="bold")
+ax4.set_xticklabels(tick_labels, rotation=45, ha="right"); ax4.legend(fontsize=8)
+
+# E: Financial Health Scores
+ax5 = fig.add_subplot(gs[2, 0])
+fin_tickers = [t for t in tick_labels if t in financial_health]
+fin_scores  = [financial_health[t]["score_100"] for t in fin_tickers]
+gc = {"A+":"#1a9641","A":"#2ecc71","B+":"#a6d96a","B":"#ffffbf","C+":"#fdae61","C":"#d73027","D":"#a50026"}
+bars_fin = ax5.bar(fin_tickers, fin_scores,
+                   color=[gc.get(financial_health[t]["grade"],"#95a5a6") for t in fin_tickers],
+                   edgecolor="white")
+ax5.set_ylabel("Financial Health Score (0–100)")
+ax5.set_title("Financial Health Score (SGD-Weighted)", fontweight="bold")
+ax5.set_xticklabels(fin_tickers, rotation=45, ha="right")
+for bar, t in zip(bars_fin, fin_tickers):
+    ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+             financial_health[t]["grade"], ha="center", fontsize=9, fontweight="bold")
+
+# F: SGD Loss Curve
+ax6 = fig.add_subplot(gs[2, 1])
+ax6.plot(range(0, n_epochs, 100), loss_history, color="#e74c3c", linewidth=2, marker="o", markersize=3)
+ax6.fill_between(range(0, n_epochs, 100), loss_history, alpha=0.15, color="#e74c3c")
+ax6.set_xlabel("Epoch (×100)"); ax6.set_ylabel("MSE Loss")
+ax6.set_title("SGD Weight Optimisation — Loss Convergence", fontweight="bold")
+
+# G: Model CV Accuracy
+ax7 = fig.add_subplot(gs[3, 0])
+m_names = list(cv_results.keys())
+m_means = [cv_results[m].mean() for m in m_names]
+m_stds  = [cv_results[m].std()  for m in m_names]
+bars_ml = ax7.bar(m_names, m_means, yerr=m_stds,
+                  color=["#3498db","#e74c3c","#2ecc71"], capsize=6, edgecolor="white")
+ax7.axhline(0.5, color="gray", linestyle="--", linewidth=1, label="Random baseline")
+ax7.set_ylim([0.4, 0.85]); ax7.set_ylabel("5-Fold CV Accuracy")
+ax7.set_title("ML Model Performance (5-Fold CV)", fontweight="bold"); ax7.legend()
+for bar, score in zip(bars_ml, m_means):
+    ax7.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+             f"{score:.3f}", ha="center", fontsize=11, fontweight="bold")
+
+# H: XGBoost Feature Importance
+ax8 = fig.add_subplot(gs[3, 1])
+top8 = imp_df.head(8)
+ax8.barh(top8["Feature"][::-1], top8["Importance"][::-1],
+         color=sns.color_palette("Blues_d", 8), edgecolor="white")
+ax8.set_xlabel("Importance")
+ax8.set_title("XGBoost Feature Importances (Top 8)", fontweight="bold")
+
+plt.savefig("/content/stock_analysis_dashboard.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("\n  ✓ Dashboard saved to /content/stock_analysis_dashboard.png")
+
+# ── 14. FINAL SIGNAL SUMMARY ─────────────────────────────────
+print("\n" + "=" * 60)
+print("  FINAL COMPOSITE SIGNAL SUMMARY")
+print("=" * 60)
+print(f"\n  {'Name':22s} {'Ticker':8s} {'Sentiment':10s} "
+      f"{'Fin Grade':10s} {'Vol Regime':12s} {'Consensus':10s}")
+print("  " + "-" * 76)
+for _, row in summary_df.iterrows():
+    print(f"  {row['Name']:22s} {row['Ticker']:8s} "
+          f"{row['Sent_Label']:10s} {row['Fin_Grade']:10s} "
+          f"{row['Vol_Regime']:12s} {row['Consensus']:10s}")
+
+print("\n" + "=" * 60)
+print("  ANALYSIS COMPLETE")
+print("  Dashboard: /content/stock_analysis_dashboard.png")
+print("=" * 60)
