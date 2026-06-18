@@ -1,0 +1,77 @@
+//@version=5
+indicator("AUD/NZD 4H Long-Only Mean-Reversion — Signal & Alerts", overlay=true, max_labels_count=500)
+
+// =============================================================================
+// AUD/NZD 4H LONG-ONLY MEAN-REVERSION — forward-test signal/alert indicator
+// Mirrors SPEC_audnzd.md (PASS 6/6). NO position sizing baked in (sized manually).
+// Fires an alert when a LONG entry triggers; plots bands, stop (1R), exit target.
+//
+// LOCKED CONFIG (do not tune):
+//   z = (close - SMA50) / rollingSD(50)
+//   ENTRY  : LONG when z <= -1.5   (long-only; shorts dropped)
+//   STOP   : 3.0*SD band below mean = 1R   (fixed at entry)
+//   EXIT   : z rises to -0.5 (revert-partial, before the mean)
+//   GATE   : 4H ADX(14) < 20  (range-bound only)
+//   SESSION: entries only 00:00-10:00 UTC; trades managed 24h
+//   FLOOR  : reject entry if stop distance < 0.00050 (5 pips)
+//   FILL   : signal on CLOSED bar -> act next bar open (alerts use barstate.isconfirmed)
+// =============================================================================
+
+// ---- Inputs (defaults = locked SPEC values; exposed so you can verify) -------
+len        = input.int(50,    "SMA / SD window")
+entryZ     = input.float(-1.5, "Entry z (<=)",        step=0.1)
+exitZ      = input.float(-0.5, "Exit z (>=)",         step=0.1)
+stopSD     = input.float(3.0,  "Stop band (SD = 1R)", step=0.5)
+adxLen     = input.int(14,    "ADX length")
+adxMax     = input.float(20.0, "ADX gate (<)",        step=1.0)
+sessStart  = input.int(0,     "Session start hour UTC", minval=0, maxval=23)
+sessEnd    = input.int(10,    "Session end hour UTC",   minval=0, maxval=23)
+minRisk    = input.float(0.00050, "Min stop distance (price)", step=0.00010)
+
+// ---- Core series (all on closed-bar values) ---------------------------------
+basis = ta.sma(close, len)
+sd    = ta.stdev(close, len)
+z     = (close - basis) / sd
+
+lowerEntry = basis + entryZ * sd        // z = -1.5 band (entry trigger level)
+stopLevel  = basis - stopSD * sd        // 3 SD below mean = 1R stop
+exitLevel  = basis + exitZ * sd         // z = -0.5 band (exit target)
+
+// ---- ADX(14) regime gate -----------------------------------------------------
+[diplus, diminus, adx] = ta.dmi(adxLen, adxLen)
+rangeGate = adx < adxMax
+
+// ---- Session gate: TRUE UTC, independent of chart timezone -------------------
+// hour(time, "UTC") forces real UTC so the gate never drifts with the chart's
+// display timezone (e.g. London = UTC+1 in summer, UTC+0 in winter).
+hUTC = hour(time, "UTC")
+inSession = hUTC >= sessStart and hUTC < sessEnd
+
+// ---- Min-risk floor (thin-session SD-collapse guard) -------------------------
+riskDist  = close - stopLevel            // distance to 1R stop (price units)
+riskOK    = riskDist >= minRisk
+
+// ---- Entry condition ---------------------------------------------------------
+longTrigger = z <= entryZ and rangeGate and inSession and riskOK
+
+// fresh-cross only (don't re-fire every bar z stays below -1.5)
+longSignal = longTrigger and not (z[1] <= entryZ)
+
+// ---- Plots -------------------------------------------------------------------
+plot(basis,      "SMA50",       color=color.new(color.gray, 0),   linewidth=1)
+plot(lowerEntry, "Entry -1.5σ", color=color.new(color.teal, 0),   linewidth=1)
+plot(exitLevel,  "Exit -0.5σ",  color=color.new(color.orange, 0), linewidth=1, style=plot.style_circles)
+plot(stopLevel,  "Stop 3σ (1R)",color=color.new(color.red, 0),    linewidth=1)
+
+bgcolor(rangeGate and inSession ? color.new(color.teal, 92) : na, title="Armed window (gate+session)")
+
+plotshape(longSignal, title="LONG entry", style=shape.triangleup, location=location.belowbar, color=color.new(color.teal, 0), size=size.small, text="LONG")
+
+// ---- Alert (fires once per confirmed bar where a fresh long triggers) --------
+alertcondition(longSignal, title="AUD/NZD LONG entry",
+     message="AUDNZD LONG | entry≈{{close}} | stop(1R)={{plot('Stop 3σ (1R)')}} | exit={{plot('Exit -0.5σ')}} | z<=-1.5, ADX<20, UTC session")
+
+// Optional: exit-target reached on an open trade (manual-managed; informational)
+exitReached = z >= exitZ and z[1] < exitZ
+alertcondition(exitReached, title="AUD/NZD exit target (z=-0.5) reached",
+     message="AUDNZD exit target z=-0.5 reached near {{close}} — manage open long")
