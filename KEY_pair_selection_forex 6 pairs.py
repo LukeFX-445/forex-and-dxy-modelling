@@ -249,7 +249,11 @@ def fetch_interest_rates():
         return {}
     df_rates = tables[0]
     # Ensure column names are standard
-    df_rates.columns = [col.strip() for col in df_rates.columns]
+    df_rates.columns = [str(col).strip() for col in df_rates.columns]
+    if 'Country' not in df_rates.columns or 'Last' not in df_rates.columns:
+        # Page layout changed (e.g. headers now carry sort glyphs); fall back to ForexFactory rates below
+        print("Interest-rate table layout not recognised; skipping TradingEconomics rates.")
+        return {}
 
     # Map currencies to country/region names as listed on TradingEconomics
     country_map = {
