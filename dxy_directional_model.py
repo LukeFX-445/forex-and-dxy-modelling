@@ -8,9 +8,14 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+MC_SEED = 42  # seed for the Monte Carlo simulation, so the directional call is reproducible
+
 # Fetch 5 years of DXY (US Dollar Index) data
 ticker = "DX-Y.NYB"
-dxy_data = yf.download(ticker, period="5y", interval="1d")
+dxy_data = yf.download(ticker, period="5y", interval="1d", auto_adjust=False)
+# yfinance returns (Price, Ticker) MultiIndex columns even for one ticker; flatten to plain names
+if isinstance(dxy_data.columns, pd.MultiIndex):
+    dxy_data.columns = dxy_data.columns.get_level_values(0)
 # Ensure proper column naming for later use
 dxy_data = dxy_data.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"close", "Volume":"volume"})
 print(f"Fetched {len(dxy_data)} daily data points from {dxy_data.index[0].date()} to {dxy_data.index[-1].date()}.")
@@ -55,9 +60,9 @@ swept_high = today_high > prev_high  # took out previous day's high
 swept_low = today_low < prev_low    # took out previous day's low
 
 liquidity_bias = 0
-if swept_high.any() and not swept_low.any():
+if swept_high and not swept_low:
     liquidity_bias = -1  # only high swept: took liquidity above (potential bearish reversal)
-elif swept_low.any() and not swept_high.any():
+elif swept_low and not swept_high:
     liquidity_bias = 1   # only low swept: took liquidity below (potential bullish reversal)
 print(f"Swept High: {str(swept_high)}, Swept Low: {str(swept_low)}, Liquidity Bias = {liquidity_bias}")
 
@@ -85,32 +90,35 @@ close_price = dxy_data['close'].iloc[-1]
 dist_to_high = (prev_week_high - close_price) / close_price * 100
 dist_to_low = (close_price - prev_week_low) / close_price * 100
 
-print(f"Distance to last week's high: {float(dist_to_high.iloc[0]):.2f}%, to low: {float(dist_to_low.iloc[0]):.2f}%")
+print(f"Distance to last week's high: {dist_to_high:.2f}%, to low: {dist_to_low:.2f}%")
 
 # Calculate 10-day vs 50-day volatility ratio
 short_vol = dxy_returns.iloc[-10:].std()
 long_vol = dxy_returns.iloc[-50:].std()
 vol_ratio = short_vol / long_vol
-print(f"10-day vs 50-day volatility ratio: {vol_ratio.iloc[0]:.2f}")
+print(f"10-day vs 50-day volatility ratio: {vol_ratio:.2f}")
 
 # Dependencies: see requirements.txt (pip install -r requirements.txt)
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Parse latest news headlines related to DXY or USD
-news_feed = feedparser.parse("https://news.google.com/rss/search?q=US+Dollar+Index+DXY")
 analyzer = SentimentIntensityAnalyzer()
 scores = []
-for entry in news_feed.entries[:10]:  # consider up to 10 recent news items
-    title = entry.title
-    vs = analyzer.polarity_scores(title)
-    scores.append(vs['compound'])
+try:
+    news_feed = feedparser.parse("https://news.google.com/rss/search?q=US+Dollar+Index+DXY")
+    for entry in news_feed.entries[:10]:  # consider up to 10 recent news items
+        title = entry.title
+        vs = analyzer.polarity_scores(title)
+        scores.append(vs['compound'])
+except Exception as e:
+    print(f"News feed unavailable ({e}); using neutral sentiment.")
 avg_sentiment = np.mean(scores) if scores else 0
 print(f"Avg news sentiment (compound VADER score) = {avg_sentiment:.2f}")
 
 import math
 # Use forecast volatility (next_vol) from GARCH and historical mean return
-mean_ret = dxy_returns.mean().iloc[0] # Extract scalar from Series
+mean_ret = dxy_returns.mean()
 vol = next_vol  # forecasted vol in %
 # Introduce a directional drift based on technical bias (e.g., trend)
 # Removed problematic technical trend calculation and drift based on it
@@ -119,8 +127,9 @@ import numpy as np
 
 # Assuming mean_ret and vol are already defined in % (e.g., 0.1 for 0.1%)
 sim_count = 1000
-last_price = dxy_data['close'].iloc[-1].iloc[0] # Extract scalar from Series
+last_price = dxy_data['close'].iloc[-1]
 
+np.random.seed(MC_SEED)
 ups = 0
 for _ in range(sim_count):
     # simulate return (normal dist) without technical trend drift
