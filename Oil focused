@@ -48,7 +48,7 @@ if _lgb_err: print("lgb import/install error:", _lgb_err)
 # 1) IMPORTS
 # ----------------------------
 import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from scipy import stats
 
 from sklearn.preprocessing import RobustScaler
@@ -67,7 +67,7 @@ import xgboost as xgb
 SEED = 42
 np.random.seed(SEED)
 
-END_DATE = datetime.utcnow()
+END_DATE = datetime.now(timezone.utc)
 START_DATE = END_DATE - timedelta(days=6 * 365)
 
 ASSETS = {
@@ -259,7 +259,7 @@ def _fit_best_arch(r):
             am = arch_model(r, mean="Zero", **kw)
             res = am.fit(disp="off")
             candidates.append((res.aic,name,dist,res))
-        except:
+        except Exception:
             continue
     if not candidates:
         raise RuntimeError("No ARCH models fit.")
@@ -308,7 +308,7 @@ def fit_markov_regime(r, k=3):
         out = pd.DataFrame({f"regime_{i}_prob":probs[i] for i in range(k)}, index=idx)
         out["regime_current"] = out.idxmax(axis=1).str.extract("(\d+)").astype(int)
         return out
-    except:
+    except Exception:
         vz = zscore(r.rolling(20).std(),60)
         rc = pd.cut(vz,[-np.inf,-0.5,0.5,np.inf],labels=[0,1,2]).astype(float)
         return pd.DataFrame({"regime_current":rc}, index=r.index)
@@ -334,7 +334,7 @@ def encode_macro_value(v):
         try:
             if s.endswith("%"): return float(s[:-1])/100.0
             return float(s)
-        except: return 0.0
+        except Exception: return 0.0
     return 0.0
 
 def engineer_features(tkr, asset_closes, asset_highs, asset_lows, asset_volumes,
@@ -467,7 +467,7 @@ def time_series_train_best(X,y):
                 m.fit(Xs.iloc[tr],y.iloc[tr])
                 pred=m.predict(Xs.iloc[te])
                 fold_acc.append(accuracy_score(y.iloc[te],pred))
-            except:
+            except Exception:
                 ok=False; break
         if ok and fold_acc:
             models[name]=m

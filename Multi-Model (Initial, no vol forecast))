@@ -88,7 +88,7 @@ def download_with_fallback(ticker_info):
                 data = data.xs(attempt, axis=1, level=1)
             if not data.empty and len(data) > 200:
                 return data, attempt
-        except:
+        except Exception:
             continue
     return pd.DataFrame(), None
 
@@ -115,7 +115,7 @@ def collect_all_data():
                 data = data.xs(ticker, axis=1, level=1)
             if not data.empty:
                 indicator_data[ticker] = data
-        except:
+        except Exception:
             continue
     
     return asset_data, indicator_data, successful_tickers
@@ -326,11 +326,11 @@ def fit_regime_model(returns, n_regimes=3):
         for i in range(n_regimes):
             try:
                 regime_df[f'regime_{i}_vol'] = float(np.sqrt(res.params[f'sigma2[{i}]']) / 100)
-            except:
+            except Exception:
                 regime_df[f'regime_{i}_vol'] = 0.01
         
         return regime_df
-    except:
+    except Exception:
         # Fallback: simple volatility-based regimes
         vol = returns.rolling(20).std()
         vol_z = (vol - vol.rolling(60).mean()) / vol.rolling(60).std()

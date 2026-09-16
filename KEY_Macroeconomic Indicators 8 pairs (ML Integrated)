@@ -13,7 +13,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import sys
 import requests
@@ -88,7 +88,7 @@ print(f"✓ Collected data for {len(data)} currencies")
 
 print("\n[2/10] Processing price data and computing returns...")
 
-end_date = datetime.utcnow()
+end_date = datetime.now(timezone.utc)
 start_date = end_date - timedelta(days=3*365)
 
 tickers_list = list(tickers.values())
@@ -983,7 +983,7 @@ print("=" * 80)
 
 try:
     bt_file     = 'fx_forecast_backtest.csv'
-    today_stamp = pd.Timestamp.utcnow().normalize()
+    today_stamp = pd.Timestamp.now(tz="UTC").normalize()
 
     bt_rows = []
     for cur in currencies:
@@ -1143,7 +1143,7 @@ for cur in currencies:
 pd.DataFrame(forecast_summary).T.to_csv('multi_horizon_forecasts.csv')
 
 metadata = {
-    'timestamp_utc':       pd.Timestamp.utcnow().isoformat(),
+    'timestamp_utc':       pd.Timestamp.now(tz="UTC").isoformat(),
     'python_version':      sys.version.split()[0],
     'currencies_analyzed': len(currencies),
     'simulation_trials':   trials,

@@ -44,7 +44,7 @@ import pandas as pd
 import yfinance as yf
 import json, re, requests
 from io import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from scipy import stats
 from sklearn.preprocessing import RobustScaler
@@ -69,7 +69,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 SEED             = 42
 np.random.seed(SEED)
 
-END_DATE         = datetime.utcnow()
+END_DATE         = datetime.now(timezone.utc)
 START_DATE       = END_DATE - timedelta(days=5 * 365)
 
 FORECAST_HORIZON = 3          # bars ahead for ML directional target
@@ -267,7 +267,7 @@ def _persist_rates(rates: dict, source: dict):
     """Write the current rates dict to the cache file with metadata."""
     try:
         payload = {
-            "fetched_utc": datetime.utcnow().isoformat(),
+            "fetched_utc": datetime.now(timezone.utc).isoformat(),
             "rates":       rates,
             "source":      source,
         }
@@ -286,7 +286,7 @@ def _load_cached_rates() -> tuple:
         with open(RATES_CACHE_FILE) as f:
             payload = json.load(f)
         fetched = datetime.fromisoformat(payload["fetched_utc"])
-        age_h   = (datetime.utcnow() - fetched).total_seconds() / 3600
+        age_h   = (datetime.now(timezone.utc) - fetched).total_seconds() / 3600
         rates   = {k: float(v) for k, v in payload["rates"].items()
                    if k in RATE_CURRENCIES}
         src     = {k: f"cache ({age_h:.0f}h old)" for k in rates}
@@ -717,7 +717,7 @@ def fit_regime_model(returns: pd.Series) -> pd.DataFrame:
         means = []
         for k in const_keys:
             try:    means.append(float(res.params[k]))
-            except: means.append(0.0)
+            except Exception: means.append(0.0)
         while len(means) < N_REGIMES:
             means.append(0.0)
 
@@ -727,7 +727,7 @@ def fit_regime_model(returns: pd.Series) -> pd.DataFrame:
             try:
                 v = float(np.sqrt(abs(res.params[k])) / 100)
                 vols_raw.append(v if (np.isfinite(v) and v > 0) else fvol)
-            except:
+            except Exception:
                 vols_raw.append(fvol)
         while len(vols_raw) < N_REGIMES:
             vols_raw.append(fvol)
