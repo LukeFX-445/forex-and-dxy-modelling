@@ -3,7 +3,7 @@ Directional model for the US Dollar Index (DXY).
 
 This script retrieves historical DXY data, calculates average daily range, performs principal component analysis on correlated markets (gold, volatility index, stock indices), checks for liquidity sweeps, forecasts volatility with GARCH, scrapes news sentiment and simulates price paths to determine directional bias (bullish, bearish or neutral).
 """
-!pip install yfinance pandas numpy  # install necessary libraries
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -14,7 +14,7 @@ dxy_data = yf.download(ticker, period="5y", interval="1d")
 # Ensure proper column naming for later use
 dxy_data = dxy_data.rename(columns={"Open":"open", "High":"high", "Low":"low", "Close":"close", "Volume":"volume"})
 print(f"Fetched {len(dxy_data)} daily data points from {dxy_data.index[0].date()} to {dxy_data.index[-1].date()}.")
-display(dxy_data.tail(3))  # display last 3 days for verification
+print(dxy_data.tail(3))  # print last 3 days for verification
 
 # Compute Average Daily Range (ADR) over a 14-day window
 dxy_data['daily_range'] = dxy_data['high'] - dxy_data['low']
@@ -26,7 +26,7 @@ adr_value = dxy_data['ADR_14'].iloc[-2]  # use penultimate ADR (last day might n
 expansion = latest_range > adr_value  # True if today's range > recent ADR (volatility expansion)
 print(f"Latest daily range = {latest_range:.4f}, 14-day ADR = {adr_value:.4f}, Expansion = {expansion}")
 
-!pip install scikit-learn
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 from sklearn.decomposition import PCA
 
 # Fetch correlated markets: Gold, VIX, S&P500 for the same period
@@ -61,7 +61,7 @@ elif swept_low.any() and not swept_high.any():
     liquidity_bias = 1   # only low swept: took liquidity below (potential bullish reversal)
 print(f"Swept High: {str(swept_high)}, Swept Low: {str(swept_low)}, Liquidity Bias = {liquidity_bias}")
 
-!pip install arch
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 from arch import arch_model
 
 # Prepare returns for volatility modeling
@@ -93,7 +93,7 @@ long_vol = dxy_returns.iloc[-50:].std()
 vol_ratio = short_vol / long_vol
 print(f"10-day vs 50-day volatility ratio: {vol_ratio.iloc[0]:.2f}")
 
-!pip install feedparser vaderSentiment
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 import feedparser
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 

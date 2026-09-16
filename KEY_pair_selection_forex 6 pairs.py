@@ -1,5 +1,5 @@
 # --- Minimal fixes: (1) auto_adjust=False for yfinance; (2) 403-safe interest-rate fetch; (3) rescale=False in 2nd GARCH; (4) local returns fallback ---
-!pip install yfinance --quiet
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 import yfinance as yf
 import pandas as pd
 from io import StringIO
@@ -36,7 +36,7 @@ except Exception as _e:
 
 
 # 1. Install libraries (if not already installed in Colab)
-!pip install yfinance arch investpy pandas_datareader -q
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 
 # 2. Imports
 import pandas as pd
@@ -221,7 +221,7 @@ if not cal.empty:
                 # Without actual forecast data, we'll assume a potential hawkish surprise bias.
                 event_drift_boost[affected] += 0.001  # small upward drift (0.1%) for potential hike
 
-!pip install feedparser vaderSentiment yfinance arch pandas numpy
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 
 import pandas as pd
 import numpy as np
@@ -363,7 +363,7 @@ rates = fetch_interest_rates()
 price_data, momentum = fetch_price_data()
 
 # ADD: ForexFactory calendar (secondary source) + interest rate fallback via ForexFactory
-!pip install beautifulsoup4 lxml html5lib -q
+# Dependencies: see requirements.txt (pip install -r requirements.txt)
 
 import json, re, time
 import requests
