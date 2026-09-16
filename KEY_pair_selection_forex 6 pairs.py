@@ -175,51 +175,15 @@ except Exception as _e:
     vol_forecast_enh = {}
 
 # 7. Economic calendar integration: check for any high-impact events for each currency in the next horizon.
-from investpy.news import economic_calendar
-
+# Calendar events come from ForexFactory (fetch_ff_calendar, merged into these boosts further below).
 today = dt.date.today()
 # Set up date windows
 tomorrow = today + dt.timedelta(days=1)
 week_ahead = today + dt.timedelta(days=7)
 
-# Fetch high-impact events from today through the next 7 days.
-try:
-    cal = economic_calendar(countries=['united states','euro zone','united kingdom','japan','canada','switzerland'],
-                             importances=['high'], from_date=today.strftime('%d/%m/%Y'), to_date=week_ahead.strftime('%d/%m/%Y'))
-except Exception as e:
-    cal = pd.DataFrame()  # if fetch fails, use empty dataframe
-
 # Determine event-driven volatility or bias adjustments
 event_vol_boost = {cur: 1.0 for cur in currencies}  # multiplier for volatility
 event_drift_boost = {cur: 0.0 for cur in currencies}  # additive drift (in fraction per day)
-if not cal.empty:
-    for _, event in cal.iterrows():
-        ccy = str(event['currency']).upper() if 'currency' in event else ''
-        # Map currency code to our keys
-        if ccy == 'USD':
-            affected = 'USD_Index'
-        elif ccy in ['EUR','EURZONE','EUR ZONE']:
-            affected = 'EURUSD'
-        elif ccy == 'GBP':
-            affected = 'GBPUSD'
-        elif ccy == 'JPY':
-            affected = 'JPYUSD'
-        elif ccy == 'CAD':
-            affected = 'CADUSD'
-        elif ccy == 'CHF':
-            affected = 'CHFUSD'
-        else:
-            affected = None
-        if affected and affected in event_vol_boost:
-            # Increase volatility for this currency due to upcoming high-impact event
-            event_vol_boost[affected] = 1.3  # e.g., 30% vol increase
-            # If the event is a rate decision or Fed meeting, we might also adjust drift:
-            title = str(event.get('event', '')).lower()
-            if 'interest rate' in title or 'central bank' in title or 'fed' in title:
-                # If a hike expected, assume bullish drift for that currency, if cut expected, bearish
-                # Here we simplisticly check if "decision" is in title as a sign of a policy meeting.
-                # Without actual forecast data, we'll assume a potential hawkish surprise bias.
-                event_drift_boost[affected] += 0.001  # small upward drift (0.1%) for potential hike
 
 # Dependencies: see requirements.txt (pip install -r requirements.txt)
 
@@ -784,7 +748,7 @@ for key in currencies:
         'total': mom + sent + carry
     }
 
-# ADD: Merge ForexFactory calendar into event boosts (keeps investpy; uses max boost)
+# ADD: Merge ForexFactory calendar into event boosts (sole calendar source; uses max boost)
 try:
     ff_cal = fetch_ff_calendar(today, week_ahead)
 except Exception:
@@ -874,7 +838,7 @@ except Exception as _e:
 # ADD: Simple backtest logger — logs today's forecast vol and fills yesterday's realized
 try:
     bt_file = 'fx_vol_backtest.csv'
-    today_stamp = pd.Timestamp.utcnow().normalize()
+    today_stamp = pd.Timestamp.now(tz="UTC").normalize()
     rows = []
     for cur in currencies:
         f = max(vol_forecast_best.get(cur, np.nan), vol_forecast_enh.get(cur, np.nan)) if not np.isnan(vol_forecast_best.get(cur, np.nan)) else vol_forecast_enh.get(cur, np.nan)
@@ -905,7 +869,7 @@ except Exception as _e:
 try:
     import json, sys
     meta = {
-        'timestamp_utc': pd.Timestamp.utcnow().isoformat(),
+        'timestamp_utc': pd.Timestamp.now(tz="UTC").isoformat(),
         'python': sys.version.split()[0],
         'pandas': pd.__version__,
         'numpy': np.__version__,
