@@ -37,9 +37,13 @@ from sklearn.decomposition import PCA
 # Fetch correlated markets: Gold, VIX, S&P500 for the same period
 other_tickers = ["GC=F", "^VIX", "^GSPC"]  # Gold futures, CBOE VIX, S&P 500 index
 other_data = yf.download(other_tickers, start=dxy_data.index[0].date(), end=dxy_data.index[-1].date(), interval="1d")['Close']
-# Align and compute daily returns for PCA
-all_close = pd.concat([dxy_data['close'], other_data], axis=1).dropna()
-all_close.columns = ['DXY', 'Gold', 'VIX', 'SPX']
+# yfinance does not return columns in request order, so select each Close by ticker label
+other_names = {"GC=F": "Gold", "^VIX": "VIX", "^GSPC": "SPX"}
+# Align and compute daily returns for PCA (DXY must stay first: dxy_loading below reads index 0)
+all_close = pd.concat(
+    {"DXY": dxy_data['close'], **{name: other_data[tkr] for tkr, name in other_names.items()}},
+    axis=1, sort=True,
+).dropna()
 returns = all_close.pct_change().dropna()
 
 # Perform PCA on returns of DXY, Gold, VIX, SPX
